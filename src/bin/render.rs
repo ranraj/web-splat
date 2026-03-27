@@ -114,10 +114,12 @@ async fn render_views(
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             renderer.render(&mut render_pass, &pc);
         }
@@ -142,7 +144,9 @@ async fn main() {
 
     let scene = Scene::from_json(scene_file).unwrap();
 
-    let wgpu_context = WGPUContext::new_instance().await;
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let wgpu_context = WGPUContext::new(&instance, None).await;
     let device = &wgpu_context.device;
     let queue = &wgpu_context.queue;
 
@@ -226,8 +230,7 @@ pub async fn download_texture(
     let sub_idx = queue.submit(std::iter::once(encoder.finish()));
 
     let mut image = {
-        let data: wgpu::BufferView<'_> =
-            download_buffer(device, &staging_buffer, Some(sub_idx)).await;
+        let data: wgpu::BufferView = download_buffer(device, &staging_buffer, Some(sub_idx)).await;
 
         ImageBuffer::<Rgba<u8>, _>::from_raw(
             bytes_per_row / texel_size,
@@ -245,19 +248,19 @@ pub async fn download_texture(
     return image::imageops::crop(&mut image, 0, 0, fb_size.width, fb_size.height).to_image();
 }
 
-async fn download_buffer<'a>(
+async fn download_buffer(
     device: &wgpu::Device,
-    buffer: &'a wgpu::Buffer,
+    buffer: &wgpu::Buffer,
     wait_idx: Option<wgpu::SubmissionIndex>,
-) -> wgpu::BufferView<'a> {
+) -> wgpu::BufferView {
     let slice = buffer.slice(..);
 
     let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
     slice.map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
     device
-        .poll(match wait_idx {
-            Some(idx) => wgpu::MaintainBase::WaitForSubmissionIndex(idx),
-            None => wgpu::MaintainBase::Wait,
+        .poll(wgpu::PollType::Wait {
+            submission_index: wait_idx,
+            timeout: None,
         })
         .unwrap();
     rx.receive().await.unwrap().unwrap();

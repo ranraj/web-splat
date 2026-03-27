@@ -4,12 +4,12 @@ use std::{
     sync::Arc,
 };
 
+use egui_wgpu::EguiDisplayHandle;
 use renderer::Display;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
 #[cfg(target_arch = "wasm32")]
 use web_time::{Duration, Instant};
-use wgpu::Backends;
 
 use cgmath::{Deg, EuclideanSpace, Point3, Quaternion, UlpsEq, Vector2, Vector3};
 use egui::FullOutput;
@@ -66,15 +66,6 @@ pub struct WGPUContext {
 }
 
 impl WGPUContext {
-    pub async fn new_instance() -> Self {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: Backends::PRIMARY,
-            ..Default::default()
-        });
-
-        return WGPUContext::new(&instance, None).await;
-    }
-
     pub async fn new(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'static>>) -> Self {
         let adapter = wgpu::util::initialize_adapter_from_env_or_default(instance, surface)
             .await
@@ -168,7 +159,9 @@ impl WindowContext {
 
         let window = Arc::new(window);
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(
+            wgpu::InstanceDescriptor::new_with_display_handle_from_env(window.clone_for_wgpu()),
+        );
 
         let surface: wgpu::Surface = instance.create_surface(window.clone())?;
 
@@ -399,10 +392,14 @@ impl WindowContext {
         &mut self,
         redraw_scene: bool,
         shapes: Option<FullOutput>,
-    ) -> Result<(), wgpu::SurfaceError> {
+    ) -> Result<(), wgpu::CurrentSurfaceTexture> {
         self.stopwatch.as_mut().map(|s| s.reset());
 
-        let output = self.surface.get_current_texture()?;
+        let output = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => surface_texture,
+            err => return Err(err),
+        };
         let view_rgb = output.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.config.format.remove_srgb_suffix()),
             ..Default::default()
@@ -452,7 +449,7 @@ impl WindowContext {
                     view: self.display.texture(),
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.splatting_args.background_color),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -835,9 +832,9 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                     match state.render(request_redraw,state.ui_visible.then_some(shapes)) {
                         Ok(_) => {}
                         // Reconfigure the surface if lost
-                        Err(wgpu::SurfaceError::Lost) => state.resize(state.window.inner_size(), None),
+                        Err(wgpu::CurrentSurfaceTexture::Suboptimal(_)) => state.resize(state.window.inner_size(), None),
+                        Err(wgpu::CurrentSurfaceTexture::Lost) => state.resize(state.window.inner_size(), None),
                         // The system is out of memory, we should probably quit
-                        Err(wgpu::SurfaceError::OutOfMemory) =>target.exit(),
                         // All other errors (Outdated, Timeout) should be resolved by the next frame
                         Err(e) => println!("error: {:?}", e),
                     }
