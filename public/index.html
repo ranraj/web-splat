@@ -117,6 +117,52 @@
             height: 100%;
         }
 
+        .uploader {
+            width: min(90vw, 520px);
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            padding: 16px;
+            margin-top: 16px;
+            text-align: left;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .uploader label {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            font-size: 0.9rem;
+            opacity: 0.95;
+        }
+
+        .uploader input[type="file"] {
+            color: white;
+        }
+
+        .uploader button {
+            appearance: none;
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            padding: 10px 14px;
+            font-size: 0.95rem;
+            cursor: pointer;
+        }
+
+        .uploader button:hover {
+            background: rgba(255, 255, 255, 0.16);
+        }
+
+        .uploader-help {
+            margin: 0;
+            font-size: 0.82rem;
+            opacity: 0.7;
+        }
+
         canvas {
             touch-action: none;
             /* Prevent default touch behaviors */
@@ -128,6 +174,107 @@
             user-select: none;
         }
     </style>
+    <style>
+        .navbar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 64px;
+            background: #111111cc;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            z-index: 2000;
+            border-bottom: 1px solid #2226;
+            padding: 0 32px;
+            box-sizing: border-box;
+            font-family: Inter, Arial, Helvetica, sans-serif;
+            backdrop-filter: blur(8px);
+        }
+        .navbar-left {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            font-weight: 600;
+            font-size: 1.2rem;
+        }
+        .navbar-center {
+            font-size: 1rem;
+            opacity: 0.8;
+        }
+        .navbar-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .navbar-uploader {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .navbar-uploader label {
+            font-size: 0.95rem;
+            opacity: 0.9;
+            margin-right: 4px;
+        }
+        .navbar-uploader input[type="file"] {
+            color: white;
+            background: none;
+            border: none;
+            font-size: 0.95rem;
+        }
+        .navbar-uploader button {
+            appearance: none;
+            border: 1px solid rgba(255,255,255,0.35);
+            border-radius: 8px;
+            background: rgba(59,130,246,0.15);
+            color: #fff;
+            padding: 7px 14px;
+            font-size: 0.95rem;
+            cursor: pointer;
+            margin-left: 4px;
+            transition: background 0.15s;
+        }
+        .navbar-uploader button:hover {
+            background: rgba(59,130,246,0.28);
+        }
+        body {
+            padding-top: 64px;
+        }
+        @media (max-width: 600px) {
+            .navbar {
+                flex-direction: column;
+                height: auto;
+                padding: 8px 8px;
+                gap: 8px;
+            }
+            body {
+                padding-top: 90px;
+            }
+        }
+    </style>
+
+    <div class="navbar">
+        <div class="navbar-left">
+            <span style="font-weight:700;letter-spacing:1px;">VirtualBhoomi Studio</span>
+            <span style="font-size:0.95rem;font-weight:400;opacity:0.7;">Demo Project</span>
+        </div>
+        <div class="navbar-center" id="navbar-status">Ready</div>
+        <div class="navbar-right">
+            <form class="navbar-uploader" id="navbar-uploader" onsubmit="return false;">
+                <label>Point cloud
+                    <input id="nav-pc-upload" type="file" accept=".ply,.npz" />
+                </label>
+                <label>Scene
+                    <input id="nav-scene-upload" type="file" accept=".json,application/json" />
+                </label>
+                <button id="nav-render-upload" type="button">Render</button>
+            </form>
+        </div>
+    </div>
+
     <div id="spinner" style="display: none;">
         <svg>
             <circle class="bg" cx="57" cy="57" r="52" />
@@ -138,7 +285,10 @@
     </div>
     <div id="no-file" class="alert" style="display: none;">
         <h1>No file specified</h1>
-        <p>There is no file specified in the URL.</p>
+        <p>Use URL query params or choose local files above.</p>
+        <div class="uploader" style="display:none;">
+            <!-- Uploader moved to navbar -->
+        </div>
     </div>
     <div id="no-webgpu" class="alert" style="display: none;">
         <h1>WebGPU not supported</h1>
@@ -173,8 +323,12 @@
             throw Error("WebGPU not supported.");
         }
 
-        import init, { run_wasm } from "./web_splats.js";
+        import init, { run_wasm, reload_pc_wasm } from "./web_splats.js";
         let init_promise = init();
+        // Tracks whether a first render has been started.
+        // On subsequent uploads we call reload_pc_wasm() instead of run_wasm()
+        // because WASM only supports one EventLoop per page lifetime.
+        let renderActive = false;
 
         let params = new URLSearchParams(window.location.search);
         let scene_file = params.get("scene");
@@ -214,11 +368,95 @@
                 })
             );
         }
+        function getErrorText(e) {
+            if (e && "cause" in e && e.cause && "statusText" in e.cause) {
+                return `${e.message}: ${e.cause.statusText}`;
+            }
+            if (e && "message" in e) {
+                return e.message;
+            }
+            return String(e);
+        }
+
+        function showError(e, fileName) {
+            document.getElementById("spinner").style.display = "none";
+            let errorPane = document.getElementById("loading-error");
+            errorPane.style.display = "flex";
+            errorPane.getElementsByTagName("p")[0].innerHTML = `${getErrorText(e)}<pre>${fileName || ""}</pre>`;
+            console.error(e);
+        }
+
+        let handlersAttached = false;
+        function attachWindowHandlers() {
+            if (handlersAttached) return;
+            handlersAttached = true;
+            window.addEventListener('resize', function () {
+                let canvas = document.getElementById("window-canvas");
+                if (!canvas) {
+                    return;
+                }
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+            }, true);
+
+            document.addEventListener('contextmenu', event => event.preventDefault());
+        }
+
+        async function runWithData(pcData, sceneData, pcName, sceneName) {
+            document.getElementById("loading-error").style.display = "none";
+
+            if (renderActive) {
+                // A render is already running — hot-reload the new file inside the
+                // existing WASM event loop instead of starting a new one.
+                reload_pc_wasm(pcData, sceneData || null);
+                return;
+            }
+
+            // First render: start the WASM event loop.
+            document.getElementById("spinner").style.display = "flex";
+            await init_promise;
+            run_wasm(pcData, sceneData, pcName || null, sceneName || null);
+            renderActive = true;
+            attachWindowHandlers();
+        }
+
+        async function setupLocalUpload() {
+            let noFilePane = document.getElementById("no-file");
+            let navUploader = document.getElementById("navbar-uploader");
+            let renderButton = document.getElementById("nav-render-upload");
+            let pcUpload = document.getElementById("nav-pc-upload");
+            let sceneUpload = document.getElementById("nav-scene-upload");
+
+            noFilePane.style.display = "flex";
+            renderButton.addEventListener("click", async () => {
+                let pcLocalFile = pcUpload.files && pcUpload.files[0];
+                let sceneLocalFile = sceneUpload.files && sceneUpload.files[0];
+
+                if (!pcLocalFile) {
+                    showError(new Error("Please select a point cloud file (.ply or .npz)."), "");
+                    noFilePane.style.display = "flex";
+                    return;
+                }
+
+                try {
+                    let pcData = new Uint8Array(await pcLocalFile.arrayBuffer());
+                    let sceneData = null;
+                    if (sceneLocalFile) {
+                        sceneData = new Uint8Array(await sceneLocalFile.arrayBuffer());
+                    }
+                    noFilePane.style.display = "none";
+                    await runWithData(pcData, sceneData, pcLocalFile.name, sceneLocalFile ? sceneLocalFile.name : null);
+                } catch (e) {
+                    showError(e, pcLocalFile.name);
+                    noFilePane.style.display = "flex";
+                }
+            });
+        }
+
         if (!pc_file) {
-            document.getElementById("no-file").style.display = "flex";
+            setupLocalUpload();
         } else {
             try {
-                document.getElementById("spinner").style.display = "flex";
                 let pc_promise = fetch(pc_file).then(withProgress).then(response => response.arrayBuffer()).then(data => new Uint8Array(data));
                 var scene_promise = Promise.resolve(null);
                 if (scene_file) {
@@ -230,21 +468,10 @@
                 }
 
                 let [pc_data, scene_data] = await Promise.all([pc_promise, scene_promise]);
-                await init_promise;
-                run_wasm(pc_data, scene_data, pc_file, scene_file);
+                await runWithData(pc_data, scene_data, pc_file, scene_file);
             } catch (e) {
-                document.getElementById("spinner").style.display = "none";
-                let errorPane = document.getElementById("loading-error");
-                errorPane.style.display = "flex";
-                errorPane.getElementsByTagName("p")[0].innerHTML = e.message + ("cause" in e ? ": " + e.cause.statusText : "") + "<pre>" + pc_file + "</pre>";
-                console.error(e.cause.statusText);
+                showError(e, pc_file);
             }
-            window.addEventListener('resize', function (event) {
-                document.getElementById("window-canvas").width = window.innerWidth;
-                document.getElementById("window-canvas").height = window.innerHeight;
-            }, true);
-
-            document.addEventListener('contextmenu', event => event.preventDefault());
         }
     </script>
 </body>

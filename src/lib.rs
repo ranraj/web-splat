@@ -210,22 +210,70 @@ impl WindowContext {
             GaussianRenderer::new(&device, &queue, render_format, pc.sh_deg(), pc.compressed())
                 .await;
 
-        let aabb = pc.bbox();
         let aspect = size.width as f32 / size.height as f32;
+
+        // Auto-frame: derive centroid and bounding-sphere radius (both measured from the
+        // statistical centroid — fixes the old behaviour where radius was from the AABB
+        // centre, which could differ by 30-50 % for asymmetric scenes).
+        let (centroid, radius) = pc.centroid_and_radius();
+
+        // ── Interior scene auto-framing ─────────────────────────────────────────────────
+        //
+        // For room-scale / interior 3DGS scenes the camera MUST be placed INSIDE the
+        // point cloud.  Placing it outside (large radius × multiplier) produces the
+        // "dark vignette / tunnel-of-splats" artefact visible in Image 1:
+        //
+        //   • Wall / ceiling Gaussians are seen from an exterior angle.
+        //   • They project as very large, blurry ellipses that cover the screen edges.
+        //   • The only clear area is the hole where we look through the dense cloud.
+        //
+        // Solution — keep the camera near the centroid (inside the room):
+        //
+        //   pullback  = radius × 0.20  →  20 % of bounding radius in –Z direction.
+        //               This is small enough to stay inside any room-scale scene while
+        //               still giving the orbit controller a non-zero target→camera vector.
+        //               The camera looks in +Z (identity quaternion), revealing the room
+        //               interior directly in front.
+        //
+        //   eye_rise  = radius × 0.15  in  world_up direction  (toward the ceiling in
+        //               the standard 3DGS / OpenCV Y-down convention where world_up ≈
+        //               (0,−1,0)).  This shifts the initial view from mid-room height to
+        //               approximately eye level.
+        //
+        //   FOV       = 60 °  (horizontal).  Wider than the 45° default; gives the
+        //               natural "standing inside a room" perspective that matches the
+        //               Marble WorldLabs reference viewer.
+        //
+        //   near plane = 0.005  (half the old 0.01) so close-by splats are not clipped.
+        let world_up = pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
+        let back_dist = radius * 0.20; // small pull-back — stays inside the room
+        let eye_rise  = radius * 0.15; // upward shift → eye-level rather than mid-floor
+        let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
         let view_camera = PerspectiveCamera::new(
-            aabb.center() - Vector3::new(1., 1., 1.) * aabb.radius() * 0.5,
+            centroid + camera_offset,
+            // Identity rotation: camera looks in +Z — straight into the room interior.
             Quaternion::one(),
             PerspectiveProjection::new(
                 Vector2::new(size.width, size.height),
-                Vector2::new(Deg(45.), Deg(45. / aspect)),
-                0.01,
+                // 60 ° horizontal FOV for a natural room-scale perspective.
+                Vector2::new(Deg(60.0f32), Deg(60.0f32 / aspect)),
+                0.005, // very small near plane: close splats (furniture, walls) stay visible
                 1000.,
             ),
         );
 
         let mut controller = CameraController::new(0.1, 0.05);
-        controller.center = pc.center();
-        // controller.up = pc.up;
+        // Orbit center = statistical centroid so every drag pivots around the scene.
+        controller.center = centroid;
+        // Set the stable orbit axis from the scene's best-fit plane normal.  This keeps
+        // the horizon level during 360° horizontal rotation and prevents gimbal flip.
+        controller.up = pc.up();
+
+        // Cache scene bounds so JS can read them via get_scene_bounds() at any time.
+        #[cfg(target_arch = "wasm32")]
+        SCENE_BOUNDS.with(|cell| {
+            *cell.borrow_mut() = Some(pc.scene_bounds());
+        });
         let ui_renderer = ui_renderer::EguiWGPU::new(device, surface_format, &window);
 
         let display = Display::new(
@@ -298,6 +346,64 @@ impl WindowContext {
             let file = std::fs::File::open(scene_path)?;
 
             self.set_scene(Scene::from_json(file)?);
+        }
+        Ok(())
+    }
+
+    /// Reload point cloud from raw bytes (used for in-place re-render on WASM without restart)
+    #[cfg(target_arch = "wasm32")]
+    fn reload_from_bytes(
+        &mut self,
+        pc_bytes: Vec<u8>,
+        scene_bytes: Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        use std::io::Cursor;
+        let pc_raw = io::GenericGaussianPointCloud::load(Cursor::new(pc_bytes))?;
+        self.pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
+
+        // Auto-frame using the same interior-placement formula as WindowContext::new().
+        // See the detailed comment there for the derivation.
+        let (centroid, radius) = self.pc.centroid_and_radius();
+        let world_up = self.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
+        let back_dist = radius * 0.20;
+        let eye_rise  = radius * 0.15;
+        let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        self.splatting_args.camera = PerspectiveCamera::new(
+            centroid + camera_offset,
+            Quaternion::one(),
+            PerspectiveProjection::new(
+                Vector2::new(self.config.width, self.config.height),
+                Vector2::new(Deg(60.0f32), Deg(60.0f32 / aspect)),
+                0.005,
+                1000.,
+            ),
+        );
+        // Mirror exactly what WindowContext::new does — just set center, no reset_to_camera.
+        // Calling reset_to_camera with identity rotation corrupts the controller center
+        // (projects it along +Z instead of toward the PC center) causing wrong camera orientation.
+        self.controller.center = centroid;
+        self.controller.up = self.pc.up();
+        // Update the JS-readable bounds cache.
+        SCENE_BOUNDS.with(|cell| {
+            *cell.borrow_mut() = Some(self.pc.scene_bounds());
+        });
+        self.splatting_args.max_sh_deg = self.pc.sh_deg();
+        self.animation = None;
+        self.scene = None;
+        self.current_view = None;
+        self.splatting_args.scene_center = None;
+        self.splatting_args.scene_extend = None;
+        self.splatting_args.walltime = Duration::ZERO;
+
+        if let Some(scene_bytes) = scene_bytes {
+            match Scene::from_json(Cursor::new(scene_bytes)) {
+                Ok(scene) => {
+                    self.set_scene(scene);
+                    self.set_scene_camera(0);
+                }
+                Err(e) => log::warn!("could not load scene on reload: {:?}", e),
+            }
         }
         Ok(())
     }
@@ -652,8 +758,11 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
     let window = event_loop.create_window(window_attributes).unwrap();
 
     #[cfg(target_arch = "wasm32")]
+    let my_generation: u32;
+    #[cfg(target_arch = "wasm32")]
     {
         use winit::platform::web::WindowExtWebSys;
+        my_generation = RENDER_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
         // On wasm, append the canvas to the document body
         web_sys::window()
             .and_then(|win| win.document())
@@ -661,6 +770,12 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 doc.get_element_by_id("loading-display")
                     .unwrap()
                     .set_text_content(Some("Unpacking"));
+                // Remove any existing canvas to prevent invisible stacking on re-render
+                if let Some(old_canvas) = doc.get_element_by_id("window-canvas") {
+                    if let Some(parent) = old_canvas.parent_node() {
+                        let _ = parent.remove_child(&*old_canvas);
+                    }
+                }
                 doc.body()
             })
             .and_then(|body| {
@@ -708,7 +823,54 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
     let mut last = Instant::now();
 
     #[allow(deprecated)]
-    event_loop.run(move |event,target|
+    event_loop.run(move |event,target| {
+        // Stop this event loop if a newer render has been started
+        #[cfg(target_arch = "wasm32")]
+        if RENDER_GENERATION.load(std::sync::atomic::Ordering::Relaxed) != my_generation {
+            target.exit();
+            return;
+        }
+
+        // On WASM: check if JS requested an in-place reload (new file uploaded while already rendering).
+        // We must NOT create a new EventLoop for re-renders — instead we swap the point cloud here.
+        #[cfg(target_arch = "wasm32")]
+        if let Event::NewEvents(_) = &event {
+            let pending = PENDING_RELOAD.with(|cell| cell.borrow_mut().take());
+            if let Some((pc_bytes, scene_bytes)) = pending {
+                match state.reload_from_bytes(pc_bytes, scene_bytes) {
+                    Ok(()) => {
+                        log::info!("point cloud hot-reloaded successfully");
+                        state.window.request_redraw();
+                    }
+                    Err(e) => log::error!("hot-reload failed: {:?}", e),
+                }
+            }
+
+            // Check if JS called auto_center_camera() to explicitly reset the view.
+            let needs_center = PENDING_AUTO_CENTER.with(|cell| {
+                std::mem::replace(&mut *cell.borrow_mut(), false)
+            });
+            if needs_center {
+                // Re-frame using the same interior-placement formula as WindowContext::new().
+                let (centroid, radius) = state.pc.centroid_and_radius();
+                let world_up = state.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
+                let back_dist = radius * 0.20;
+                let eye_rise  = radius * 0.15;
+                let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
+                state.splatting_args.camera.position = centroid + camera_offset;
+                state.splatting_args.camera.rotation = Quaternion::one();
+                state.splatting_args.camera.fit_near_far(state.pc.bbox());
+                state.controller.center = centroid;
+                state.controller.up = state.pc.up();
+                log::info!(
+                    "auto_frame_scene: centroid={:?} radius={:.3}",
+                    centroid,
+                    radius
+                );
+                state.window.request_redraw();
+            }
+        }
+
         match event {
             Event::NewEvents(e) =>  match e{
                 winit::event::StartCause::ResumeTimeReached { .. }=>{
@@ -851,8 +1013,95 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
         } => {
             state.controller.process_mouse(delta.0 as f32, delta.1 as f32)
         }
-        _ => {},
+        _ => {}
+        }
     }).unwrap();
+}
+
+#[cfg(target_arch = "wasm32")]
+static RENDER_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+// Thread-local storage for a pending point cloud reload requested from JS.
+// On WASM, a second EventLoop cannot be created, so re-renders must be done
+// by signalling the running event loop with new file bytes via reload_pc_wasm().
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_RELOAD: std::cell::RefCell<Option<(Vec<u8>, Option<Vec<u8>>)>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Signal from JS that the running event loop should re-run auto-centering on the
+/// currently loaded point cloud (without reloading it).
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_AUTO_CENTER: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+}
+
+/// Caches [cx, cy, cz, radius] for the currently loaded point cloud so that
+/// `get_scene_bounds()` can return them synchronously from JS.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static SCENE_BOUNDS: std::cell::RefCell<Option<[f32; 4]>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Called from JS when the user uploads a new file while a render is already active.
+/// Stores the new data so the running event loop can swap the point cloud in-place.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn reload_pc_wasm(pc: Vec<u8>, scene: Option<Vec<u8>>) {
+    PENDING_RELOAD.with(|cell| {
+        *cell.borrow_mut() = Some((pc, scene));
+    });
+}
+
+/// Signals the running event loop to reposition the camera so it frames the entire
+/// loaded splat cloud (centroid + radius × 2.2 pull-back with a slight elevation).
+/// Call this from JavaScript after `run_wasm` resolves for a guaranteed well-framed
+/// first view, or at any time to reset without reloading the file.
+///
+/// Alias: `auto_frame_scene` is preferred for new code; `auto_center_camera` is kept
+/// for backward compatibility.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn auto_center_camera() {
+    PENDING_AUTO_CENTER.with(|cell| {
+        *cell.borrow_mut() = true;
+    });
+}
+
+/// Preferred alias for `auto_center_camera`.  Signals the event loop to reset the
+/// camera to the optimal framing of the full scene (centroid, 2.2 × bounding radius,
+/// slight elevation).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn auto_frame_scene() {
+    PENDING_AUTO_CENTER.with(|cell| {
+        *cell.borrow_mut() = true;
+    });
+}
+
+/// Returns the scene bounds as a 4-element `Float32Array`: `[cx, cy, cz, radius]`.
+///
+/// `cx/cy/cz` — statistical centroid (mean position of all Gaussian splats).
+/// `radius`   — radius of the bounding sphere centred on the centroid that
+///              encloses every splat (computed from the AABB corners in O(1)).
+///
+/// Returns `null` if no point cloud has been loaded yet.
+///
+/// ### Usage in JavaScript / TypeScript
+/// ```js
+/// const bounds = get_scene_bounds();          // Float32Array [cx, cy, cz, r]
+/// if (bounds) console.log("centroid:", bounds[0], bounds[1], bounds[2],
+///                          "radius:", bounds[3]);
+/// ```
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn get_scene_bounds() -> Option<Vec<f32>> {
+    SCENE_BOUNDS.with(|cell| {
+        cell.borrow().map(|b| b.to_vec())
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -866,7 +1115,9 @@ pub async fn run_wasm(
     use std::{io::Cursor, str::FromStr};
 
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-    console_log::init().expect("could not initialize logger");
+    let _ = console_log::init(); // ignore error if logger already initialized (e.g. on re-render)
+    // Increment generation to signal the currently running event loop (if any) to stop
+    RENDER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let pc_reader = Cursor::new(pc);
     let scene_reader = scene.map(|d: Vec<u8>| Cursor::new(d));
 

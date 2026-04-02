@@ -344,6 +344,41 @@ impl PointCloud {
         self.center
     }
 
+    /// Radius of the smallest sphere centred on the **statistical centroid** that
+    /// contains all Gaussian positions.
+    ///
+    /// Rather than re-iterating every point, we use the 8 corners of the already-computed
+    /// tight AABB as proxies — because every Gaussian lies inside the AABB, the farthest
+    /// AABB corner from the centroid is a guaranteed upper bound on the true bounding-sphere
+    /// radius.  This is O(1) after the initial AABB pass and always >= the true radius.
+    ///
+    /// Note: this is different from `Aabb::radius()`, which is the half-diagonal measured
+    /// from the *AABB centre* (not the centroid).  For asymmetric scenes the two values
+    /// can differ by 30–50 %, which is why the camera used to appear too close.
+    pub fn bsphere_radius_from_centroid(&self) -> f32 {
+        let c = self.center;
+        self.bbox
+            .corners()
+            .iter()
+            .map(|corner| corner.distance(c))
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// Returns the statistical centroid (mean position of all splat points) and the
+    /// bounding-sphere radius measured **from that centroid** (see
+    /// [`Self::bsphere_radius_from_centroid`]).  Both values are derived from data
+    /// computed in a single pass over the points during loading.
+    pub fn centroid_and_radius(&self) -> (Point3<f32>, f32) {
+        (self.center, self.bsphere_radius_from_centroid())
+    }
+
+    /// Returns `[cx, cy, cz, radius]` — the scene centroid and bounding-sphere radius
+    /// as a flat array, convenient for passing to JavaScript via `wasm_bindgen`.
+    pub fn scene_bounds(&self) -> [f32; 4] {
+        let (c, r) = self.centroid_and_radius();
+        [c.x, c.y, c.z, r]
+    }
+
     pub fn up(&self) -> Option<Vector3<f32>> {
         self.up
     }

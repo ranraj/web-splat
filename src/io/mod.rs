@@ -71,7 +71,13 @@ impl GenericGaussianPointCloud {
         covars: Option<Vec<Covariance3D>>,
         quantization: Option<GaussianQuantization>,
     ) -> Self {
-        let mut bbox: Aabb<f32> = Aabb::zeroed();
+        // Start with inverted extremes so that grow() produces the tight AABB of
+        // the actual Gaussian positions — not an AABB that always includes the
+        // origin (the old Aabb::zeroed() bug).
+        let mut bbox = Aabb::new(
+            Point3::new(f32::MAX, f32::MAX, f32::MAX),
+            Point3::new(-f32::MAX, -f32::MAX, -f32::MAX),
+        );
         for v in &gaussians {
             bbox.grow(&v.xyz);
         }
@@ -116,7 +122,11 @@ impl GenericGaussianPointCloud {
         covars: Option<Vec<Covariance3D>>,
         quantization: Option<GaussianQuantization>,
     ) -> Self {
-        let mut bbox: Aabb<f32> = Aabb::unit();
+        // Same tight-AABB initialization as the uncompressed path.
+        let mut bbox = Aabb::new(
+            Point3::new(f32::MAX, f32::MAX, f32::MAX),
+            Point3::new(-f32::MAX, -f32::MAX, -f32::MAX),
+        );
         for v in &gaussians {
             bbox.grow(&v.xyz);
         }
