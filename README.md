@@ -70,5 +70,15 @@ If you find our work useful, please cite:
 }
 ```
 
+Pod	Controls
+Move Camera D-pad	W / A / S / D
+Rotate Camera D-pad	↑ ↓ ← → (Arrow keys)
+Tilt Camera	Z (⟲L) / X (⟳R)
+Altitude	E (up) / Q (down)
+Zoom	+/– (fires WheelEvent on canvas)
+Move Target mini D-pad	I / J / K / L
+
+
+
 cargo check --target wasm32-unknown-unknown --lib 2>&1 | Select-String -Pattern "^error|^warning.*unused|Finished|^error\[" | Select-Object -Last 30
 cargo check --target wasm32-unknown-unknown --lib 2>&1 | Tee-Object -Variable out ; $out | Select-String "error|Finished" | Select-Object -Last 20

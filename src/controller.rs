@@ -50,19 +50,19 @@ pub struct CameraController {
     pub up: Option<Vector3<f32>>,
 
     // Held-key booleans for FPS movement (set true on keydown, false on keyup)
-    move_forward: bool,
-    move_backward: bool,
-    move_left: bool,
-    move_right: bool,
-    move_up: bool,
-    move_down: bool,
-    roll_left: bool,
-    roll_right: bool,
+    pub move_forward: bool,
+    pub move_backward: bool,
+    pub move_left: bool,
+    pub move_right: bool,
+    pub move_up: bool,
+    pub move_down: bool,
+    pub roll_left: bool,
+    pub roll_right: bool,
 
     // Impulse accumulators for smooth orbit (mouse/arrow keys) and pan (I/J/K/L)
-    shift: Vector2<f32>,
-    rotation: Vector3<f32>,
-    scroll: f32,
+    pub shift: Vector2<f32>,
+    pub rotation: Vector3<f32>,
+    pub scroll: f32,
 
     pub speed: f32,
     pub sensitivity: f32,

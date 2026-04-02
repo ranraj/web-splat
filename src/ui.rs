@@ -6,7 +6,7 @@ use web_time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::renderer::DEFAULT_KERNEL_SIZE;
-use crate::{SceneCamera, Split, WindowContext};
+use crate::{CameraController, SceneCamera, Split, WindowContext};
 use cgmath::{Euler, Matrix3, Quaternion};
 #[cfg(not(target_arch = "wasm32"))]
 use egui::Vec2b;
@@ -15,6 +15,7 @@ use egui::Vec2b;
 use egui::{Align2, Vec2};
 
 use egui::{Color32, RichText, emath::Numeric};
+use winit::keyboard::KeyCode;
 
 #[cfg(not(target_arch = "wasm32"))]
 use egui_plot::{Legend, PlotPoints};
@@ -397,6 +398,11 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                 });
         });
 
+    // ── Gamepad overlay panel ─────────────────────────────────────
+    if state.gamepad_visible {
+        gamepad_panel(ctx, &mut state.controller);
+    }
+
     let requested_repaint = ctx.has_requested_repaint();
 
     if let Some(c) = new_camera {
@@ -413,6 +419,225 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
         }
     }
     return requested_repaint;
+}
+
+// ── Gamepad overlay panel ─────────────────────────────────────────────────────
+//
+// Renders an on-screen gaming console overlay anchored to the bottom-centre of
+// the viewport.  Buttons directly mutate the CameraController fields, exactly as
+// real keyboard/scroll events do — no synthetic browser events needed.
+//
+// Five groups matching the HTML overlay that was removed:
+//   Move Camera   → W/A/S/D  (move_forward/back/left/right boolean flags)
+//   Rotate Camera → Arrow keys (rotation impulse accumulator)
+//   Tilt Camera   → Z/X (roll_left / roll_right booleans)
+//   Altitude      → E/Q (move_up / move_down booleans)
+//   Move Target   → I/J/K/L (shift impulse accumulator)
+//   Zoom          → scroll accumulator
+//
+// Buttons are drawn with a dark semi-transparent style.  Held state is tracked
+// via egui's pointer-down test: on each frame the flag is set while the button
+// is being pressed and cleared when released.
+fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
+    let btn_fill      = egui::Color32::from_rgba_unmultiplied(12, 14, 22, 160);
+    let btn_stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
+    let active_fill   = egui::Color32::from_rgba_unmultiplied(79, 156, 249, 100);
+    let active_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(99, 179, 237, 180));
+    let lbl_col       = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 97);
+    let hint_col      = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 46);
+    let panel_fill    = egui::Color32::from_rgba_unmultiplied(8, 10, 16, 158);
+    let rounding14    = egui::CornerRadius::same(14);
+    let rounding12    = egui::CornerRadius::same(12);
+
+    // 30×30 custom-drawn button — shows blue active highlight when pressed.
+    let btn = |ui: &mut egui::Ui, label: &str, active: bool| -> egui::Response {
+        let (bg, stroke, fg) = if active {
+            (active_fill, active_stroke, egui::Color32::WHITE)
+        } else {
+            (btn_fill, btn_stroke, lbl_col)
+        };
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(30.0, 30.0),
+            egui::Sense::click_and_drag(),
+        );
+        if ui.is_rect_visible(rect) {
+            ui.painter().rect(rect, egui::CornerRadius::same(8), bg, stroke, egui::StrokeKind::Inside);
+            ui.painter().text(
+                rect.center(), egui::Align2::CENTER_CENTER,
+                label, egui::FontId::proportional(11.0), fg,
+            );
+        }
+        resp
+    };
+
+    // Tiny uppercase caption above each pod.
+    let group_lbl = |ui: &mut egui::Ui, text: &str| {
+        ui.label(egui::RichText::new(text)
+            .size(7.0)
+            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 77))
+            .strong());
+    };
+
+    // egui::Window shrink-wraps to its content, unlike egui::Area which
+    // defaults to the full screen rect and causes wide inner Frames to
+    // fill the whole viewport (the dark-band bug).
+    // Frame::new() = transparent bg / no border / no shadow.
+    egui::Window::new("__gamepad__")
+        .id(egui::Id::new("gpad_win"))
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .movable(false)
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::Vec2::new(0.0, -24.0))
+        .frame(egui::Frame::new())
+        .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+
+            // ── Row 1: Move Camera  +  Rotate Camera ─────────────────────
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(14.0, 4.0);
+
+                // MOVE CAMERA (W A S D)
+                egui::Frame::new()
+                    .fill(panel_fill).corner_radius(rounding14)
+                    .inner_margin(egui::Margin::same(11))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                        group_lbl(ui, "MOVE CAMERA");
+                        // ▲
+                        ui.horizontal(|ui| {
+                            ui.add_space(33.0);
+                            let r = btn(ui, "▲", ctrl.move_forward);
+                            ctrl.process_keyboard(KeyCode::KeyW, r.is_pointer_button_down_on());
+                        });
+                        // ◀ · ▶
+                        ui.horizontal(|ui| {
+                            let r = btn(ui, "◀", ctrl.move_left);
+                            ctrl.process_keyboard(KeyCode::KeyA, r.is_pointer_button_down_on());
+                            ui.add_space(30.0);
+                            let r = btn(ui, "▶", ctrl.move_right);
+                            ctrl.process_keyboard(KeyCode::KeyD, r.is_pointer_button_down_on());
+                        });
+                        // ▼
+                        ui.horizontal(|ui| {
+                            ui.add_space(33.0);
+                            let r = btn(ui, "▼", ctrl.move_backward);
+                            ctrl.process_keyboard(KeyCode::KeyS, r.is_pointer_button_down_on());
+                        });
+                    });
+
+                // ROTATE CAMERA (Arrow keys)
+                egui::Frame::new()
+                    .fill(panel_fill).corner_radius(rounding14)
+                    .inner_margin(egui::Margin::same(11))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                        group_lbl(ui, "ROTATE CAMERA");
+                        ui.horizontal(|ui| {
+                            ui.add_space(33.0);
+                            let r = btn(ui, "▲", false);
+                            if r.is_pointer_button_down_on() { ctrl.rotation.y += 2.0; ctrl.user_inptut = true; }
+                        });
+                        ui.horizontal(|ui| {
+                            let r = btn(ui, "◀", false);
+                            if r.is_pointer_button_down_on() { ctrl.rotation.x -= 2.0; ctrl.user_inptut = true; }
+                            ui.add_space(30.0);
+                            let r = btn(ui, "▶", false);
+                            if r.is_pointer_button_down_on() { ctrl.rotation.x += 2.0; ctrl.user_inptut = true; }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(33.0);
+                            let r = btn(ui, "▼", false);
+                            if r.is_pointer_button_down_on() { ctrl.rotation.y -= 2.0; ctrl.user_inptut = true; }
+                        });
+                    });
+            });
+
+            // ── Row 2: Tilt · Altitude · Zoom · Move Target ───────────────
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+
+                // TILT CAMERA (Z / X)
+                egui::Frame::new()
+                    .fill(panel_fill).corner_radius(rounding12)
+                    .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+                        group_lbl(ui, "TILT CAMERA");
+                        ui.horizontal(|ui| {
+                            let r = btn(ui, "⟲L", ctrl.roll_left);
+                            ctrl.process_keyboard(KeyCode::KeyZ, r.is_pointer_button_down_on());
+                            let r = btn(ui, "⟳R", ctrl.roll_right);
+                            ctrl.process_keyboard(KeyCode::KeyX, r.is_pointer_button_down_on());
+                        });
+                    });
+
+                // ALTITUDE (E / Q)
+                egui::Frame::new()
+                    .fill(panel_fill).corner_radius(rounding12)
+                    .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+                        group_lbl(ui, "ALTITUDE");
+                        ui.horizontal(|ui| {
+                            let r = btn(ui, "↑Up", ctrl.move_up);
+                            ctrl.process_keyboard(KeyCode::KeyE, r.is_pointer_button_down_on());
+                            let r = btn(ui, "↓Dn", ctrl.move_down);
+                            ctrl.process_keyboard(KeyCode::KeyQ, r.is_pointer_button_down_on());
+                        });
+                    });
+
+                // ZOOM (scroll accumulator)
+                egui::Frame::new()
+                    .fill(panel_fill).corner_radius(rounding12)
+                    .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+                        group_lbl(ui, "ZOOM");
+                        ui.horizontal(|ui| {
+                            let r = btn(ui, "＋In", false);
+                            if r.is_pointer_button_down_on() { ctrl.process_scroll(3.0); }
+                            let r = btn(ui, "－Out", false);
+                            if r.is_pointer_button_down_on() { ctrl.process_scroll(-3.0); }
+                        });
+                    });
+
+                // MOVE TARGET (I J K L)
+                egui::Frame::new()
+                    .fill(panel_fill).corner_radius(rounding12)
+                    .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                        group_lbl(ui, "MOVE TARGET");
+                        ui.horizontal(|ui| {
+                            ui.add_space(33.0);
+                            let r = btn(ui, "▲", false);
+                            if r.is_pointer_button_down_on() { ctrl.shift.x += 1.0; ctrl.user_inptut = true; }
+                        });
+                        ui.horizontal(|ui| {
+                            let r = btn(ui, "◀", false);
+                            if r.is_pointer_button_down_on() { ctrl.shift.y -= 1.0; ctrl.user_inptut = true; }
+                            ui.add_space(30.0);
+                            let r = btn(ui, "▶", false);
+                            if r.is_pointer_button_down_on() { ctrl.shift.y += 1.0; ctrl.user_inptut = true; }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(33.0);
+                            let r = btn(ui, "▼", false);
+                            if r.is_pointer_button_down_on() { ctrl.shift.x -= 1.0; ctrl.user_inptut = true; }
+                        });
+                    });
+            });
+
+            // ── Hint ──────────────────────────────────────────────────────
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("V · TOGGLE CONTROLS")
+                    .size(7.0)
+                    .color(hint_col));
+            });
+        });
 }
 
 enum SetCamera {

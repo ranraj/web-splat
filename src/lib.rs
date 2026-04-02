@@ -132,6 +132,7 @@ pub struct WindowContext {
     ui_renderer: ui_renderer::EguiWGPU,
     fps: f32,
     ui_visible: bool,
+    gamepad_visible: bool,
 
     #[cfg(not(target_arch = "wasm32"))]
     history: RingBuffer<(Duration, Duration, Duration)>,
@@ -317,7 +318,8 @@ impl WindowContext {
             fps: 0.,
             #[cfg(not(target_arch = "wasm32"))]
             history: RingBuffer::new(512),
-            ui_visible: false,
+            ui_visible: true,
+            gamepad_visible: false,
             display,
             saved_cameras: Vec::new(),
             #[cfg(feature = "video")]
@@ -907,6 +909,8 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                         }
                     }else if key == KeyCode::KeyU{
                         state.ui_visible = !state.ui_visible;
+                    }else if key == KeyCode::KeyV{
+                        state.gamepad_visible = !state.gamepad_visible;
                     }else if key == KeyCode::KeyC{
                         state.save_view();
                     } else  if key == KeyCode::KeyR && state.controller.alt_pressed{
