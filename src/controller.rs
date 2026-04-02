@@ -48,12 +48,31 @@ impl TouchState {
 pub struct CameraController {
     pub center: Point3<f32>,
     pub up: Option<Vector3<f32>>,
-    amount: Vector3<f32>,
+
+    // Held-key booleans for FPS movement (set true on keydown, false on keyup)
+    move_forward: bool,
+    move_backward: bool,
+    move_left: bool,
+    move_right: bool,
+    move_up: bool,
+    move_down: bool,
+    roll_left: bool,
+    roll_right: bool,
+
+    // Impulse accumulators for smooth orbit (mouse/arrow keys) and pan (I/J/K/L)
     shift: Vector2<f32>,
     rotation: Vector3<f32>,
     scroll: f32,
+
     pub speed: f32,
     pub sensitivity: f32,
+
+    /// Shift key held — multiplies walk speed by 3×
+    pub shift_pressed: bool,
+    /// When true, mouse motion always orbits without needing a button held
+    pub natural_mouse: bool,
+    /// When true, invert the right-drag pan direction
+    pub invert_trackpad: bool,
 
     pub left_mouse_pressed: bool,
     pub right_mouse_pressed: bool,
@@ -68,13 +87,23 @@ impl CameraController {
     pub fn new(speed: f32, sensitivity: f32) -> Self {
         Self {
             center: Point3::origin(),
-            amount: Vector3::zero(),
+            up: None,
+            move_forward: false,
+            move_backward: false,
+            move_left: false,
+            move_right: false,
+            move_up: false,
+            move_down: false,
+            roll_left: false,
+            roll_right: false,
             shift: Vector2::zero(),
             rotation: Vector3::zero(),
-            up: None,
             scroll: 0.0,
             speed,
             sensitivity,
+            shift_pressed: false,
+            natural_mouse: false,
+            invert_trackpad: false,
             left_mouse_pressed: false,
             right_mouse_pressed: false,
             alt_pressed: false,
@@ -84,51 +113,62 @@ impl CameraController {
     }
 
     pub fn process_keyboard(&mut self, key: KeyCode, pressed: bool) -> bool {
-        let amount = if pressed { 1.0 } else { 0.0 };
         let processed = match key {
-            // Move camera (WASD, QE, Space)
-            KeyCode::KeyW => { self.amount.z += amount; true }
-            KeyCode::KeyS => { self.amount.z += -amount; true }
-            KeyCode::KeyA => { self.amount.x += -amount; true }
-            KeyCode::KeyD => { self.amount.x += amount; true }
-            KeyCode::KeyE | KeyCode::Space => { self.amount.y += amount; true }
-            KeyCode::KeyQ => { self.amount.y += -amount; true }
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => { /* handled in ModifiersChanged */ true }
+            // FPS movement (boolean flags — set on press, clear on release)
+            KeyCode::KeyW => { self.move_forward  = pressed; true }
+            KeyCode::KeyS => { self.move_backward = pressed; true }
+            KeyCode::KeyA => { self.move_left     = pressed; true }
+            KeyCode::KeyD => { self.move_right    = pressed; true }
+            KeyCode::KeyE | KeyCode::Space => { self.move_up   = pressed; true }
+            KeyCode::KeyQ => { self.move_down = pressed; true }
+            // O as alias for move backward
+            KeyCode::KeyO => { self.move_backward = pressed; true }
+            // Shift — speed multiplier
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => { self.shift_pressed = pressed; true }
 
+            // Camera orbit — Arrow keys fire an impulse on press (decay naturally)
+            KeyCode::ArrowLeft  => { if pressed { self.rotation.x -= 2.0; } true } // Pitch left
+            KeyCode::ArrowRight => { if pressed { self.rotation.x += 2.0; } true } // Pitch right
+            KeyCode::ArrowUp    => { if pressed { self.rotation.y += 2.0; } true } // Yaw up
+            KeyCode::ArrowDown  => { if pressed { self.rotation.y -= 2.0; } true } // Yaw down
 
-            // Camera rotation (Arrow keys) — swapped: Left/Right = pitch, Up/Down = yaw
-            KeyCode::ArrowLeft => { self.rotation.x += -amount * 1.0; true } // Pitch up
-            KeyCode::ArrowRight => { self.rotation.x += amount * 1.0; true } // Pitch down
-            KeyCode::ArrowUp => { self.rotation.y += amount * 1.0; true } // Yaw left
-            KeyCode::ArrowDown => { self.rotation.y += -amount * 1.0; true } // Yaw right
+            // Camera roll (Z/X — boolean: held for continuous roll)
+            KeyCode::KeyZ => { self.roll_left  = pressed; true }
+            KeyCode::KeyX => { self.roll_right = pressed; true }
 
-            // Camera tilt (roll)
-            KeyCode::KeyZ => { self.rotation.z += amount * 1.0; true } // Roll left
-            KeyCode::KeyX => { self.rotation.z += -amount * 1.0; true } // Roll right
-
-            // Move target (pivot/orbit center) — swapped I/K
-            KeyCode::KeyI => { self.shift.x += amount * 1.0; true } // Move target down
-            KeyCode::KeyK => { self.shift.x += -amount * 1.0; true } // Move target up
-            KeyCode::KeyJ => { self.shift.y += -amount * 1.0; true } // Move target left
-            KeyCode::KeyL => { self.shift.y += amount * 1.0; true } // Move target right
-            KeyCode::KeyW => { self.amount.z += amount * 1.0; true } // Move target forward
-            KeyCode::KeyS => { self.amount.z += -amount * 1.0; true } // Move target backward
+            // Move target / orbit pivot — impulse on press
+            KeyCode::KeyI => { if pressed { self.shift.x += 1.0; } true } // Move target down
+            KeyCode::KeyK => { if pressed { self.shift.x -= 1.0; } true } // Move target up
+            KeyCode::KeyJ => { if pressed { self.shift.y -= 1.0; } true } // Move target left
+            KeyCode::KeyL => { if pressed { self.shift.y += 1.0; } true } // Move target right
 
             _ => false,
         };
-        self.user_inptut = processed;
+        // Flag user input when any movement key is actively held
+        if processed {
+            let moving = self.move_forward || self.move_backward
+                || self.move_left || self.move_right
+                || self.move_up   || self.move_down
+                || self.roll_left || self.roll_right;
+            if pressed || moving {
+                self.user_inptut = true;
+            }
+        }
         processed
     }
 
     pub fn process_mouse(&mut self, mouse_dx: f32, mouse_dy: f32) {
-        if self.left_mouse_pressed {
-            self.rotation.x += mouse_dx as f32;
-            self.rotation.y += mouse_dy as f32;
+        // Orbit: left-button drag, or always when natural_mouse is enabled
+        if self.left_mouse_pressed || self.natural_mouse {
+            self.rotation.x += mouse_dx;
+            self.rotation.y += mouse_dy;
             self.user_inptut = true;
         }
+        // Pan: right-button drag, with optional inversion for trackpads
         if self.right_mouse_pressed {
-            self.shift.y += -mouse_dx as f32;
-            self.shift.x += mouse_dy as f32;
+            let sign = if self.invert_trackpad { -1.0 } else { 1.0 };
+            self.shift.y += -mouse_dx * sign;
+            self.shift.x += mouse_dy * sign;
             self.user_inptut = true;
         }
     }
@@ -248,49 +288,96 @@ impl CameraController {
 
     pub fn update_camera(&mut self, camera: &mut PerspectiveCamera, dt: Duration) {
         let dt: f32 = dt.as_secs_f32();
+        if dt <= 0.0 {
+            return;
+        }
+
         let mut dir = camera.position - self.center;
         let distance = dir.magnitude();
-
+        // Safety: prevent NaN from zero-length direction
+        if !dir.x.is_finite() || !dir.y.is_finite() || !dir.z.is_finite() || distance < 1e-6 {
+            dir = Vector3::new(0.0, 0.0, 1.0);
+        }
         dir = dir.normalize_to((distance.ln() + self.scroll * dt * 10. * self.speed).exp());
 
         let view_t: Matrix3<f32> = camera.rotation.invert().into();
-
         let x_axis = view_t.x;
         let y_axis = self.up.unwrap_or(view_t.y);
         let z_axis = view_t.z;
 
+        // 1. FPS WASD/QE/Space walk — moves both camera and orbit pivot together
+        let fwd  = (self.move_forward  as i32 - self.move_backward as i32) as f32;
+        let side = (self.move_right    as i32 - self.move_left     as i32) as f32;
+        let vert = (self.move_up       as i32 - self.move_down     as i32) as f32;
+        if fwd != 0.0 || side != 0.0 || vert != 0.0 {
+            let speed_mult = if self.shift_pressed { 3.0 } else { 1.0 };
+            let walk_speed = self.speed * 2.0 * dt * speed_mult;
+            let raw = z_axis * fwd + x_axis * side - y_axis * vert;
+            let move_vec = if raw.magnitude2() > 1e-6 {
+                raw.normalize() * walk_speed
+            } else {
+                Vector3::zero()
+            };
+            camera.position += move_vec;
+            self.center += move_vec;
+            self.user_inptut = true;
+        }
+
+        // 2. Pan orbit pivot (I/J/K/L + right-mouse drag)
         let offset =
             (self.shift.y * x_axis - self.shift.x * y_axis) * dt * self.speed * 0.1 * distance;
         self.center += offset;
         camera.position += offset;
+
+        // 3. Orbit rotation (arrow keys + mouse drag)
         let mut theta = Rad((self.rotation.x) * dt * self.sensitivity);
-        let mut phi = Rad((-self.rotation.y) * dt * self.sensitivity);
-        let mut eta = Rad::zero();
+        let mut phi   = Rad((-self.rotation.y) * dt * self.sensitivity);
+
+        // 4. Roll: Z/X keys (continuous while held) — always active, no alt required
+        let roll_sign = (self.roll_left as i32 - self.roll_right as i32) as f32;
+        let mut eta = Rad(roll_sign * dt * self.sensitivity * 2.0);
 
         if self.alt_pressed {
+            // Alt overrides: use mouse/arrow Y axis for roll
             eta = Rad(-self.rotation.y * dt * self.sensitivity);
             theta = Rad::zero();
             phi = Rad::zero();
         }
 
         let rot_theta = Quaternion::from_axis_angle(y_axis, theta);
-        let rot_phi = Quaternion::from_axis_angle(x_axis, phi);
-        let rot_eta = Quaternion::from_axis_angle(z_axis, eta);
+        let rot_phi   = Quaternion::from_axis_angle(x_axis, phi);
+        let rot_eta   = Quaternion::from_axis_angle(z_axis, eta);
         let rot = rot_theta * rot_phi * rot_eta;
 
         let mut new_dir = rot.rotate_vector(dir);
-
+        // Safety: prevent NaN after rotation
+        if !new_dir.x.is_finite() || !new_dir.y.is_finite() || !new_dir.z.is_finite()
+            || new_dir.magnitude() < 1e-6
+        {
+            new_dir = dir;
+        }
         if angle_short(y_axis, new_dir) < Rad(0.1) {
             new_dir = dir;
         }
         camera.position = self.center + new_dir;
 
-        // update rotation
-        // camera.rotation = (rot * camera.rotation.invert()).invert();
-        camera.rotation = Quaternion::look_at(-new_dir, y_axis);
+        // Apply roll (Z/X keys) by rotating the orbit up-vector around the view
+        // forward axis.  This is the only way to get persistent roll — look_at()
+        // always cancels roll if we just pass y_axis unchanged.
+        let forward = (-new_dir).normalize();
+        let rolled_up = if roll_sign != 0.0 {
+            let roll_quat = Quaternion::from_axis_angle(forward, eta);
+            let new_up = roll_quat.rotate_vector(y_axis);
+            // Persist the rolled up so subsequent frames keep the tilt
+            self.up = Some(new_up.normalize());
+            new_up.normalize()
+        } else {
+            y_axis
+        };
+        camera.rotation = Quaternion::look_at(-new_dir, rolled_up);
 
-        // decay based on fps
-        let mut decay = (0.8).powf(dt * 60.);
+        // Decay impulse accumulators
+        let mut decay = (0.8_f32).powf(dt * 60.);
         if decay < 1e-4 {
             decay = 0.;
         }

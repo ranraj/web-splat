@@ -317,7 +317,7 @@ impl WindowContext {
             fps: 0.,
             #[cfg(not(target_arch = "wasm32"))]
             history: RingBuffer::new(512),
-            ui_visible: true,
+            ui_visible: false,
             display,
             saved_cameras: Vec::new(),
             #[cfg(feature = "video")]

@@ -333,16 +333,20 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                     ui.end_row();
 
                     // Desktop controls
-                    ui.label("Rotate Camera");
-                    ui.label("Arrow Up/Down (Yaw), Arrow Left/Right (Pitch), Z/X (Roll), Left click + drag / Touch + drag");
+                    ui.label("Move Camera");
+                    ui.label("W/S (forward/back)  A/D (left/right)  E or Space (up)  Q (down)  Shift (faster)");
                     ui.end_row();
 
-                    ui.label("Move Target/Center");
-                    ui.label("W/S (forward/back), I/K (up/down), J/L (left/right), Right click + drag / Two finger drag");
+                    ui.label("Rotate Camera");
+                    ui.label("Arrow Up/Down (Yaw)  Arrow Left/Right (Pitch)  Left click + drag");
                     ui.end_row();
 
                     ui.label("Tilt Camera");
-                    ui.label("Z/X (Roll), Alt + drag mouse");
+                    ui.label("Z (tilt left)  X (tilt right)  Alt + drag mouse");
+                    ui.end_row();
+
+                    ui.label("Move Target/Center");
+                    ui.label("I/K (up/down)  J/L (left/right)  Right click + drag / Two finger drag");
                     ui.end_row();
 
                     ui.label("Zoom");
