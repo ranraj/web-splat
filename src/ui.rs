@@ -328,20 +328,21 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                 .num_columns(2)
                 .striped(true)
                 .show(ui, |ui| {
+
                     ui.strong("Camera Controls");
                     ui.end_row();
 
                     // Desktop controls
                     ui.label("Rotate Camera");
-                    ui.label("Left click + drag / Touch + drag");
+                    ui.label("Arrow Up/Down (Yaw), Arrow Left/Right (Pitch), Z/X (Roll), Left click + drag / Touch + drag");
                     ui.end_row();
 
                     ui.label("Move Target/Center");
-                    ui.label("Right click + drag / Two finger drag");
+                    ui.label("W/S (forward/back), I/K (up/down), J/L (left/right), Right click + drag / Two finger drag");
                     ui.end_row();
 
                     ui.label("Tilt Camera");
-                    ui.label("Alt + drag mouse");
+                    ui.label("Z/X (Roll), Alt + drag mouse");
                     ui.end_row();
 
                     ui.label("Zoom");

@@ -86,42 +86,38 @@ impl CameraController {
     pub fn process_keyboard(&mut self, key: KeyCode, pressed: bool) -> bool {
         let amount = if pressed { 1.0 } else { 0.0 };
         let processed = match key {
-            KeyCode::KeyW | KeyCode::ArrowUp => {
-                self.amount.z += amount;
-                true
-            }
-            KeyCode::KeyS | KeyCode::ArrowDown => {
-                self.amount.z += -amount;
-                true
-            }
-            KeyCode::KeyA | KeyCode::ArrowLeft => {
-                self.amount.x += -amount;
-                true
-            }
-            KeyCode::KeyD | KeyCode::ArrowRight => {
-                self.amount.x += amount;
-                true
-            }
-            KeyCode::KeyQ => {
-                self.rotation.z += amount / self.sensitivity;
-                true
-            }
-            KeyCode::KeyE => {
-                self.rotation.z += -amount / self.sensitivity;
-                true
-            }
-            KeyCode::Space => {
-                self.amount.y += amount;
-                true
-            }
-            KeyCode::ShiftLeft => {
-                self.amount.y += -amount;
-                true
-            }
+            // Move camera (WASD, QE, Space)
+            KeyCode::KeyW => { self.amount.z += amount; true }
+            KeyCode::KeyS => { self.amount.z += -amount; true }
+            KeyCode::KeyA => { self.amount.x += -amount; true }
+            KeyCode::KeyD => { self.amount.x += amount; true }
+            KeyCode::KeyE | KeyCode::Space => { self.amount.y += amount; true }
+            KeyCode::KeyQ => { self.amount.y += -amount; true }
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => { /* handled in ModifiersChanged */ true }
+
+
+            // Camera rotation (Arrow keys) — swapped: Left/Right = pitch, Up/Down = yaw
+            KeyCode::ArrowLeft => { self.rotation.x += -amount * 1.0; true } // Pitch up
+            KeyCode::ArrowRight => { self.rotation.x += amount * 1.0; true } // Pitch down
+            KeyCode::ArrowUp => { self.rotation.y += amount * 1.0; true } // Yaw left
+            KeyCode::ArrowDown => { self.rotation.y += -amount * 1.0; true } // Yaw right
+
+            // Camera tilt (roll)
+            KeyCode::KeyZ => { self.rotation.z += amount * 1.0; true } // Roll left
+            KeyCode::KeyX => { self.rotation.z += -amount * 1.0; true } // Roll right
+
+            // Move target (pivot/orbit center) — swapped I/K
+            KeyCode::KeyI => { self.shift.x += amount * 1.0; true } // Move target down
+            KeyCode::KeyK => { self.shift.x += -amount * 1.0; true } // Move target up
+            KeyCode::KeyJ => { self.shift.y += -amount * 1.0; true } // Move target left
+            KeyCode::KeyL => { self.shift.y += amount * 1.0; true } // Move target right
+            KeyCode::KeyW => { self.amount.z += amount * 1.0; true } // Move target forward
+            KeyCode::KeyS => { self.amount.z += -amount * 1.0; true } // Move target backward
+
             _ => false,
         };
         self.user_inptut = processed;
-        return processed;
+        processed
     }
 
     pub fn process_mouse(&mut self, mouse_dx: f32, mouse_dy: f32) {
