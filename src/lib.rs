@@ -248,7 +248,7 @@ impl WindowContext {
         //   near plane = 0.005  (half the old 0.01) so close-by splats are not clipped.
         let world_up = pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
         let back_dist = radius * 0.20; // small pull-back — stays inside the room
-        let eye_rise  = radius * 0.15; // upward shift → eye-level rather than mid-floor
+        let eye_rise  = radius * 0.07; // upward shift → lowered 30% (was 0.10)
         let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
         let view_camera = PerspectiveCamera::new(
             centroid + camera_offset,
@@ -368,7 +368,7 @@ impl WindowContext {
         let (centroid, radius) = self.pc.centroid_and_radius();
         let world_up = self.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
         let back_dist = radius * 0.20;
-        let eye_rise  = radius * 0.15;
+        let eye_rise  = radius * 0.07;
         let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
         let aspect = self.config.width as f32 / self.config.height as f32;
         self.splatting_args.camera = PerspectiveCamera::new(
@@ -409,9 +409,9 @@ impl WindowContext {
         }
 
         // Auto-start the cinematic intro pan so the scene feels alive on first load.
-        // 10-second period, ±18° horizontal sweep.
+        // 18.75-second period, ±18° horizontal sweep.
         // Stops immediately when the user clicks, touches, scrolls, or presses a key.
-        self.start_cinematic_pan(10.0, 18.0);
+        self.start_cinematic_pan(18.75, 18.0);
 
         Ok(())
     }
@@ -862,7 +862,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
 
     // Auto-start the cinematic intro pan so the scene feels alive on first load.
     // Stops immediately the moment the user clicks, touches, scrolls, or presses a key.
-    state.start_cinematic_pan(10.0, 18.0);
+    state.start_cinematic_pan(18.75, 18.0);
 
     #[allow(deprecated)]
     event_loop.run(move |event,target| {
@@ -897,7 +897,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 let (centroid, radius) = state.pc.centroid_and_radius();
                 let world_up = state.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
                 let back_dist = radius * 0.20;
-                let eye_rise  = radius * 0.15;
+                let eye_rise  = radius * 0.07;
                 let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
                 state.splatting_args.camera.position = centroid + camera_offset;
                 state.splatting_args.camera.rotation = Quaternion::one();
@@ -915,7 +915,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
             // Check if JS called start_cinematic_pan_wasm() or stop_cinematic_pan_wasm().
             if let Some(start) = PENDING_CINEMATIC.with(|cell| cell.borrow_mut().take()) {
                 if start {
-                    state.start_cinematic_pan(10.0, 18.0);
+                    state.start_cinematic_pan(18.75, 18.0);
                 } else {
                     state.cancle_animation();
                 }

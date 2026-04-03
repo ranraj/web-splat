@@ -21,7 +21,9 @@ use winit::keyboard::KeyCode;
 use egui_plot::{Legend, PlotPoints};
 
 pub(crate) fn ui(state: &mut WindowContext) -> bool {
-    let ctx = state.ui_renderer.winit.egui_ctx();
+    // Clone into an owned Context (cheap Arc bump) so `state` is no longer
+    // borrowed when we later call gamepad_panel(state) mutably.
+    let ctx = state.ui_renderer.winit.egui_ctx().clone();
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(stopwatch) = state.stopwatch.as_mut() {
         let durations = pollster::block_on(
@@ -51,7 +53,7 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
     egui::Window::new("Render Stats")
         .default_width(200.)
         .default_height(100.)
-        .show(ctx, |ui| {
+        .show(&ctx, |ui| {
             use egui::TextStyle;
             egui::Grid::new("timing").num_columns(2).show(ui, |ui| {
                 ui.colored_label(egui::Color32::WHITE, "FPS");
@@ -95,7 +97,7 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                 });
         });
 
-    egui::Window::new("⚙ Render Settings").show(ctx, |ui| {
+    egui::Window::new("⚙ Render Settings").show(&ctx, |ui| {
         egui::Grid::new("render_settings")
             .num_columns(2)
             .striped(true)
@@ -168,7 +170,7 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
         .default_width(200.)
         .resizable(true)
         .default_height(100.)
-        .show(ctx, |ui| {
+        .show(&ctx, |ui| {
             egui::Grid::new("scene info")
                 .num_columns(2)
                 .striped(false)
@@ -327,7 +329,7 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
         .default_open(false)
         .movable(false)
         .anchor(Align2::LEFT_BOTTOM, Vec2::new(10., -10.))
-        .show(ctx, |ui| {
+        .show(&ctx, |ui| {
             egui::Grid::new("controls")
                 .num_columns(2)
                 .striped(true)
@@ -405,7 +407,7 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
 
     // ── Gamepad overlay panel ─────────────────────────────────────
     if state.gamepad_visible {
-        gamepad_panel(ctx, &mut state.controller);
+        gamepad_panel(&ctx, state);
     }
 
     let requested_repaint = ctx.has_requested_repaint();
@@ -443,7 +445,13 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
 // Buttons are drawn with a dark semi-transparent style.  Held state is tracked
 // via egui's pointer-down test: on each frame the flag is set while the button
 // is being pressed and cleared when released.
-fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
+fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
+    // Snapshot animation state BEFORE mutably borrowing controller, so the
+    // egui closure below only captures `ctrl` (not `state` itself).
+    let playing = state.animation.as_ref().map(|(_, p)| *p).unwrap_or(false);
+    let mut cinematic_toggle: Option<bool> = None;
+
+    let ctrl: &mut CameraController = &mut state.controller;
     let btn_stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
     let hint_col      = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 46);
     let panel_fill    = egui::Color32::from_rgba_unmultiplied(8, 10, 16, 158);
@@ -674,6 +682,13 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
                                 if r.is_pointer_button_down_on() { ctrl.process_scroll(3.0); }
                                 let r = wbtn(ui, "-", false);
                                 if r.is_pointer_button_down_on() { ctrl.process_scroll(-3.0); }
+
+                                // Play / Pause cinematic animation
+                                let label = if playing { "Pause" } else { "Play" };
+                                let r = wbtn(ui, label, playing);
+                                if r.clicked() {
+                                    cinematic_toggle = Some(!playing);
+                                }
                             });
                         });
                 });
@@ -685,6 +700,15 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
                     .size(7.0).color(hint_col));
             });
         });
+
+    // Apply cinematic toggle AFTER the egui closure so `ctrl` borrow is released.
+    if let Some(should_play) = cinematic_toggle {
+        if should_play {
+            state.start_cinematic_pan(18.75, 18.0);
+        } else {
+            state.stop_animation();
+        }
+    }
 }
 
 // ── old orphaned code removed ──
