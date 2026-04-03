@@ -247,9 +247,21 @@ impl WindowContext {
         //
         //   near plane = 0.005  (half the old 0.01) so close-by splats are not clipped.
         let world_up = pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
-        let back_dist = radius * 0.20; // small pull-back — stays inside the room
-        let eye_rise  = radius * 0.07; // upward shift → lowered 30% (was 0.10)
+        // Lower initial camera pullback by 20% and altitude by 10%
+        let back_dist = radius * 0.12; // was 0.16 → 25% lower
+        let eye_rise  = radius * 0.063; // was 0.07 → 10% lower (0.07 * 0.9 = 0.063)
         let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
+        // Derive init_pitch from the scene's floor tilt angle so the camera sits
+        // perpendicular to the floor on load. world_up.y = cos(floor_tilt), so
+        // acos(world_up.y) gives the angle the floor normal deviates from vertical.
+        // Falls back to 0 when the scene is too small to detect a floor plane.
+        let init_pitch = if pc.up().is_some() { world_up.y.acos() } else { 0.0_f32 };
+        let (sp, cp) = init_pitch.sin_cos();
+        let camera_offset = Vector3::new(
+            camera_offset.x,
+            camera_offset.y * cp - camera_offset.z * sp,
+            camera_offset.y * sp + camera_offset.z * cp,
+        );
         let view_camera = PerspectiveCamera::new(
             centroid + camera_offset,
             // Identity rotation: camera looks in +Z — straight into the room interior.
@@ -318,7 +330,7 @@ impl WindowContext {
             fps: 0.,
             #[cfg(not(target_arch = "wasm32"))]
             history: RingBuffer::new(512),
-            ui_visible: true,
+            ui_visible: false,
             gamepad_visible: false,
             display,
             saved_cameras: Vec::new(),
@@ -367,9 +379,16 @@ impl WindowContext {
         // See the detailed comment there for the derivation.
         let (centroid, radius) = self.pc.centroid_and_radius();
         let world_up = self.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
-        let back_dist = radius * 0.20;
-        let eye_rise  = radius * 0.07;
+        let back_dist = radius * 0.12;
+        let eye_rise  = radius * 0.063;
         let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
+        let init_pitch = if self.pc.up().is_some() { world_up.y.acos() } else { 0.0_f32 };
+        let (sp, cp) = init_pitch.sin_cos();
+        let camera_offset = Vector3::new(
+            camera_offset.x,
+            camera_offset.y * cp - camera_offset.z * sp,
+            camera_offset.y * sp + camera_offset.z * cp,
+        );
         let aspect = self.config.width as f32 / self.config.height as f32;
         self.splatting_args.camera = PerspectiveCamera::new(
             centroid + camera_offset,
@@ -843,7 +862,6 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
 
     if let Some(scene) = scene {
         state.set_scene(scene);
-        state.set_scene_camera(0);
         state.scene_file_path = scene_file_path;
     }
 
@@ -896,9 +914,16 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 // Re-frame using the same interior-placement formula as WindowContext::new().
                 let (centroid, radius) = state.pc.centroid_and_radius();
                 let world_up = state.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
-                let back_dist = radius * 0.20;
-                let eye_rise  = radius * 0.07;
+                let back_dist = radius * 0.12;
+                let eye_rise  = radius * 0.063;
                 let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
+                let init_pitch = if state.pc.up().is_some() { world_up.y.acos() } else { 0.0_f32 };
+                let (sp, cp) = init_pitch.sin_cos();
+                let camera_offset = Vector3::new(
+                    camera_offset.x,
+                    camera_offset.y * cp - camera_offset.z * sp,
+                    camera_offset.y * sp + camera_offset.z * cp,
+                );
                 state.splatting_args.camera.position = centroid + camera_offset;
                 state.splatting_args.camera.rotation = Quaternion::one();
                 state.splatting_args.camera.fit_near_far(state.pc.bbox());

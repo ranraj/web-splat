@@ -662,10 +662,27 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                let r = wbtn(ui, "Up", ctrl.move_up);
-                                ctrl.process_keyboard(KeyCode::KeyE, r.is_pointer_button_down_on());
-                                let r = wbtn(ui, "Dn", ctrl.move_down);
-                                ctrl.process_keyboard(KeyCode::KeyQ, r.is_pointer_button_down_on());
+                                let r_up = wbtn(ui, "", ctrl.move_up);
+                                ctrl.process_keyboard(KeyCode::KeyE, r_up.is_pointer_button_down_on());
+                                let r_down = wbtn(ui, "", ctrl.move_down);
+                                ctrl.process_keyboard(KeyCode::KeyQ, r_down.is_pointer_button_down_on());
+
+                                // Draw arrows with the painter instead of text labels.
+                                let painter = ui.painter();
+                                let up_col = if ctrl.move_up { egui::Color32::WHITE } else { lbl_col };
+                                let down_col = if ctrl.move_down { egui::Color32::WHITE } else { lbl_col };
+
+                                let c_up = r_up.rect.center();
+                                let tip_up = egui::pos2(c_up.x, c_up.y - 6.0);
+                                let left_up = egui::pos2(c_up.x - 5.0, c_up.y + 4.0);
+                                let right_up = egui::pos2(c_up.x + 5.0, c_up.y + 4.0);
+                                painter.add(egui::Shape::convex_polygon(vec![tip_up, right_up, left_up], up_col, egui::Stroke::new(0.0, egui::Color32::TRANSPARENT)));
+
+                                let c_dn = r_down.rect.center();
+                                let tip_dn = egui::pos2(c_dn.x, c_dn.y + 6.0);
+                                let left_dn = egui::pos2(c_dn.x - 5.0, c_dn.y - 4.0);
+                                let right_dn = egui::pos2(c_dn.x + 5.0, c_dn.y - 4.0);
+                                painter.add(egui::Shape::convex_polygon(vec![tip_dn, right_dn, left_dn], down_col, egui::Stroke::new(0.0, egui::Color32::TRANSPARENT)));
                             });
                         });
                 });

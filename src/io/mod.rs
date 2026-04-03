@@ -2,7 +2,6 @@
 use std::io::BufReader;
 use std::io::{Read, Seek};
 
-use bytemuck::Zeroable;
 use cgmath::{Array, EuclideanSpace, InnerSpace, Point3, Vector3};
 use half::f16;
 

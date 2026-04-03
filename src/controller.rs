@@ -1,5 +1,4 @@
 use cgmath::*;
-use num_traits::Float;
 use std::f32::consts::PI;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
