@@ -449,196 +449,202 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
     let rounding14    = egui::CornerRadius::same(14);
     let rounding12    = egui::CornerRadius::same(12);
 
-    // 30×30 custom-drawn button — shows blue active highlight when pressed.
+    // 30×30 square button — custom-drawn, active state shown in blue.
     let btn = |ui: &mut egui::Ui, label: &str, active: bool| -> egui::Response {
         let (bg, stroke, fg) = if active {
             (active_fill, active_stroke, egui::Color32::WHITE)
         } else {
             (btn_fill, btn_stroke, lbl_col)
         };
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(30.0, 30.0),
-            egui::Sense::click_and_drag(),
-        );
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click_and_drag());
         if ui.is_rect_visible(rect) {
             ui.painter().rect(rect, egui::CornerRadius::same(8), bg, stroke, egui::StrokeKind::Inside);
-            ui.painter().text(
-                rect.center(), egui::Align2::CENTER_CENTER,
-                label, egui::FontId::proportional(11.0), fg,
-            );
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), fg);
+        }
+        resp
+    };
+
+    // 40×28 wide button for short labels (Up / Dn / + / - / <Z / X>).
+    let wbtn = |ui: &mut egui::Ui, label: &str, active: bool| -> egui::Response {
+        let (bg, stroke, fg) = if active {
+            (active_fill, active_stroke, egui::Color32::WHITE)
+        } else {
+            (btn_fill, btn_stroke, lbl_col)
+        };
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 28.0), egui::Sense::click_and_drag());
+        if ui.is_rect_visible(rect) {
+            ui.painter().rect(rect, egui::CornerRadius::same(8), bg, stroke, egui::StrokeKind::Inside);
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(11.0), fg);
         }
         resp
     };
 
     // Tiny uppercase caption above each pod.
-    let group_lbl = |ui: &mut egui::Ui, text: &str| {
-        ui.label(egui::RichText::new(text)
-            .size(7.0)
-            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 77))
-            .strong());
+    let pod_lbl = |ui: &mut egui::Ui, text: &str| {
+        ui.label(egui::RichText::new(text).size(7.0)
+            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 77)).strong());
     };
 
-    // egui::Window shrink-wraps to its content, unlike egui::Area which
-    // defaults to the full screen rect and causes wide inner Frames to
-    // fill the whole viewport (the dark-band bug).
-    // Frame::new() = transparent bg / no border / no shadow.
+    // egui::Window shrink-wraps to content (unlike Area which expands to full viewport).
     egui::Window::new("__gamepad__")
         .id(egui::Id::new("gpad_win"))
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
         .movable(false)
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::Vec2::new(0.0, -24.0))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::Vec2::new(0.0, -20.0))
         .frame(egui::Frame::new())
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
 
-            // ── Row 1: Move Camera  +  Rotate Camera ─────────────────────
+            // ── Row 1: MOVE CAMERA  +  ROTATE CAMERA ─────────────────────
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(14.0, 4.0);
+                ui.spacing_mut().item_spacing = egui::vec2(12.0, 0.0);
 
-                // MOVE CAMERA (W A S D)
-                egui::Frame::new()
-                    .fill(panel_fill).corner_radius(rounding14)
-                    .inner_margin(egui::Margin::same(11))
+                // MOVE CAMERA  (W / A / S / D)
+                // D-pad cross: each row = [30sp] [btn] [30sp] so all rows are
+                // identical 96px wide (3 × 30 + 2 × 3px gap) and ▲/▼ are
+                // centred over the gap between ◀ and ▶.
+                egui::Frame::new().fill(panel_fill).corner_radius(rounding14)
+                    .inner_margin(egui::Margin::same(10))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                        group_lbl(ui, "MOVE CAMERA");
-                        // ▲
-                        ui.horizontal(|ui| {
-                            ui.add_space(33.0);
+                        pod_lbl(ui, "MOVE CAMERA");
+                        ui.horizontal(|ui| { // [sp] [▲] [sp]
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                             let r = btn(ui, "▲", ctrl.move_forward);
                             ctrl.process_keyboard(KeyCode::KeyW, r.is_pointer_button_down_on());
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
-                        // ◀ · ▶
-                        ui.horizontal(|ui| {
+                        ui.horizontal(|ui| { // [◀] [sp] [▶]
                             let r = btn(ui, "◀", ctrl.move_left);
                             ctrl.process_keyboard(KeyCode::KeyA, r.is_pointer_button_down_on());
-                            ui.add_space(30.0);
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                             let r = btn(ui, "▶", ctrl.move_right);
                             ctrl.process_keyboard(KeyCode::KeyD, r.is_pointer_button_down_on());
                         });
-                        // ▼
-                        ui.horizontal(|ui| {
-                            ui.add_space(33.0);
+                        ui.horizontal(|ui| { // [sp] [▼] [sp]
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                             let r = btn(ui, "▼", ctrl.move_backward);
                             ctrl.process_keyboard(KeyCode::KeyS, r.is_pointer_button_down_on());
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
                     });
 
-                // ROTATE CAMERA (Arrow keys)
-                egui::Frame::new()
-                    .fill(panel_fill).corner_radius(rounding14)
-                    .inner_margin(egui::Margin::same(11))
+                // ROTATE CAMERA  (Arrow keys)
+                egui::Frame::new().fill(panel_fill).corner_radius(rounding14)
+                    .inner_margin(egui::Margin::same(10))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                        group_lbl(ui, "ROTATE CAMERA");
-                        ui.horizontal(|ui| {
-                            ui.add_space(33.0);
+                        pod_lbl(ui, "ROTATE CAMERA");
+                        ui.horizontal(|ui| { // [sp] [▲] [sp]
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                             let r = btn(ui, "▲", false);
                             if r.is_pointer_button_down_on() { ctrl.rotation.y += 2.0; ctrl.user_inptut = true; }
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal(|ui| { // [◀] [sp] [▶]
                             let r = btn(ui, "◀", false);
                             if r.is_pointer_button_down_on() { ctrl.rotation.x -= 2.0; ctrl.user_inptut = true; }
-                            ui.add_space(30.0);
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                             let r = btn(ui, "▶", false);
                             if r.is_pointer_button_down_on() { ctrl.rotation.x += 2.0; ctrl.user_inptut = true; }
                         });
-                        ui.horizontal(|ui| {
-                            ui.add_space(33.0);
+                        ui.horizontal(|ui| { // [sp] [▼] [sp]
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                             let r = btn(ui, "▼", false);
                             if r.is_pointer_button_down_on() { ctrl.rotation.y -= 2.0; ctrl.user_inptut = true; }
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
                     });
             });
 
-            // ── Row 2: Tilt · Altitude · Zoom · Move Target ───────────────
-            ui.add_space(4.0);
+            // ── Row 2: TILT · ALTITUDE · ZOOM · MOVE TARGET ───────────────
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
 
-                // TILT CAMERA (Z / X)
-                egui::Frame::new()
-                    .fill(panel_fill).corner_radius(rounding12)
+                // TILT CAMERA  (Z / X)
+                egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
                     .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
-                        group_lbl(ui, "TILT CAMERA");
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        pod_lbl(ui, "TILT CAMERA");
                         ui.horizontal(|ui| {
-                            let r = btn(ui, "⟲L", ctrl.roll_left);
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            let r = wbtn(ui, "< Z", ctrl.roll_left);
                             ctrl.process_keyboard(KeyCode::KeyZ, r.is_pointer_button_down_on());
-                            let r = btn(ui, "⟳R", ctrl.roll_right);
+                            let r = wbtn(ui, "X >", ctrl.roll_right);
                             ctrl.process_keyboard(KeyCode::KeyX, r.is_pointer_button_down_on());
                         });
                     });
 
-                // ALTITUDE (E / Q)
-                egui::Frame::new()
-                    .fill(panel_fill).corner_radius(rounding12)
+                // ALTITUDE  (E = Up, Q = Down)
+                egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
                     .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
-                        group_lbl(ui, "ALTITUDE");
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        pod_lbl(ui, "ALTITUDE");
                         ui.horizontal(|ui| {
-                            let r = btn(ui, "↑Up", ctrl.move_up);
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            let r = wbtn(ui, "Up", ctrl.move_up);
                             ctrl.process_keyboard(KeyCode::KeyE, r.is_pointer_button_down_on());
-                            let r = btn(ui, "↓Dn", ctrl.move_down);
+                            let r = wbtn(ui, "Dn", ctrl.move_down);
                             ctrl.process_keyboard(KeyCode::KeyQ, r.is_pointer_button_down_on());
                         });
                     });
 
-                // ZOOM (scroll accumulator)
-                egui::Frame::new()
-                    .fill(panel_fill).corner_radius(rounding12)
+                // ZOOM
+                egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
                     .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
-                        group_lbl(ui, "ZOOM");
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        pod_lbl(ui, "ZOOM");
                         ui.horizontal(|ui| {
-                            let r = btn(ui, "＋In", false);
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            let r = wbtn(ui, "+", false);
                             if r.is_pointer_button_down_on() { ctrl.process_scroll(3.0); }
-                            let r = btn(ui, "－Out", false);
+                            let r = wbtn(ui, "-", false);
                             if r.is_pointer_button_down_on() { ctrl.process_scroll(-3.0); }
                         });
                     });
 
-                // MOVE TARGET (I J K L)
-                egui::Frame::new()
-                    .fill(panel_fill).corner_radius(rounding12)
+                // MOVE TARGET  (same cross pattern as d-pads)
+                egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
                     .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                        group_lbl(ui, "MOVE TARGET");
-                        ui.horizontal(|ui| {
-                            ui.add_space(33.0);
+                        pod_lbl(ui, "MOVE TARGET");
+                        ui.horizontal(|ui| { // [sp] [▲] [sp]
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                             let r = btn(ui, "▲", false);
                             if r.is_pointer_button_down_on() { ctrl.shift.x += 1.0; ctrl.user_inptut = true; }
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal(|ui| { // [◀] [sp] [▶]
                             let r = btn(ui, "◀", false);
                             if r.is_pointer_button_down_on() { ctrl.shift.y -= 1.0; ctrl.user_inptut = true; }
-                            ui.add_space(30.0);
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                             let r = btn(ui, "▶", false);
                             if r.is_pointer_button_down_on() { ctrl.shift.y += 1.0; ctrl.user_inptut = true; }
                         });
-                        ui.horizontal(|ui| {
-                            ui.add_space(33.0);
+                        ui.horizontal(|ui| { // [sp] [▼] [sp]
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                             let r = btn(ui, "▼", false);
                             if r.is_pointer_button_down_on() { ctrl.shift.x -= 1.0; ctrl.user_inptut = true; }
+                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
                     });
             });
 
             // ── Hint ──────────────────────────────────────────────────────
-            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("V · TOGGLE CONTROLS")
-                    .size(7.0)
-                    .color(hint_col));
+                ui.label(egui::RichText::new("V  ·  TOGGLE CONTROLS")
+                    .size(7.0).color(hint_col));
             });
         });
 }
+
+// ── old orphaned code removed ──
 
 enum SetCamera {
     ID(usize),
