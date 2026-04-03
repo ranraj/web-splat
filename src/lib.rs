@@ -995,7 +995,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
 
                 if request_redraw || redraw_ui{
                     state.fps = (1. / dt.as_secs_f32()) * 0.05 + state.fps * 0.95;
-                    match state.render(request_redraw,state.ui_visible.then_some(shapes)) {
+                    match state.render(request_redraw, Some(shapes)) {
                         Ok(_) => {}
                         // Reconfigure the surface if lost
                         Err(wgpu::CurrentSurfaceTexture::Suboptimal(_)) => state.resize(state.window.inner_size(), None),

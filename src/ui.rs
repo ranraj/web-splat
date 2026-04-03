@@ -41,6 +41,12 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
             .num_visible_points(&state.wgpu_context.device, &state.wgpu_context.queue),
     );
 
+    let mut new_camera: Option<SetCamera> = None;
+    #[allow(unused_mut)]
+    let mut toggle_tracking_shot = false;
+
+    if state.ui_visible {
+
     #[cfg(not(target_arch = "wasm32"))]
     egui::Window::new("Render Stats")
         .default_width(200.)
@@ -158,9 +164,6 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
             });
     });
 
-    let mut new_camera: Option<SetCamera> = None;
-    #[allow(unused_mut)]
-    let mut toggle_tracking_shot = false;
     egui::Window::new("ℹ Scene")
         .default_width(200.)
         .resizable(true)
@@ -398,6 +401,8 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                 });
         });
 
+    } // end ui_visible
+
     // ── Gamepad overlay panel ─────────────────────────────────────
     if state.gamepad_visible {
         gamepad_panel(ctx, &mut state.controller);
@@ -439,64 +444,78 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
 // via egui's pointer-down test: on each frame the flag is set while the button
 // is being pressed and cleared when released.
 fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
-    let btn_fill      = egui::Color32::from_rgba_unmultiplied(12, 14, 22, 160);
     let btn_stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
+    let hint_col      = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 46);
+    let panel_fill    = egui::Color32::from_rgba_unmultiplied(8, 10, 16, 158);
+    let rounding12    = egui::CornerRadius::same(12);
     let active_fill   = egui::Color32::from_rgba_unmultiplied(79, 156, 249, 100);
     let active_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(99, 179, 237, 180));
     let lbl_col       = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 97);
-    let hint_col      = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 46);
-    let panel_fill    = egui::Color32::from_rgba_unmultiplied(8, 10, 16, 158);
-    let rounding14    = egui::CornerRadius::same(14);
-    let rounding12    = egui::CornerRadius::same(12);
 
-    // 30×30 square button — custom-drawn, active state shown in blue.
-    let btn = |ui: &mut egui::Ui, dir: &str, active: bool| -> egui::Response {
-        let (bg, stroke, fg) = if active {
-            (active_fill, active_stroke, egui::Color32::WHITE)
-        } else {
-            (btn_fill, btn_stroke, lbl_col)
-        };
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click_and_drag());
-        if ui.is_rect_visible(rect) {
-            ui.painter().rect(rect, egui::CornerRadius::same(8), bg, stroke, egui::StrokeKind::Inside);
-            let c = rect.center();
-            let s = 7.0_f32;
-            let points = match dir {
-                "up" => vec![
-                    egui::pos2(c.x, c.y - s),
-                    egui::pos2(c.x + s, c.y + s * 0.7),
-                    egui::pos2(c.x - s, c.y + s * 0.7),
-                ],
-                "down" => vec![
-                    egui::pos2(c.x, c.y + s),
-                    egui::pos2(c.x + s, c.y - s * 0.7),
-                    egui::pos2(c.x - s, c.y - s * 0.7),
-                ],
-                "left" => vec![
-                    egui::pos2(c.x - s, c.y),
-                    egui::pos2(c.x + s * 0.7, c.y - s),
-                    egui::pos2(c.x + s * 0.7, c.y + s),
-                ],
-                "right" => vec![
-                    egui::pos2(c.x + s, c.y),
-                    egui::pos2(c.x - s * 0.7, c.y - s),
-                    egui::pos2(c.x - s * 0.7, c.y + s),
-                ],
-                _ => vec![],
-            };
-            if !points.is_empty() {
-                ui.painter().add(egui::Shape::convex_polygon(points, fg, egui::Stroke::NONE));
-            }
-        }
-        resp
+    // Uppercase caption above each pod.
+    let pod_lbl = |ui: &mut egui::Ui, text: &str| {
+        ui.label(egui::RichText::new(text).size(10.0)
+            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210)).strong());
     };
 
-    // 40×28 wide button for short labels (Up / Dn / + / - / <Z / X>).
+    // Helper: draws chevrons on a circle.
+    let draw_dpad_circle = |painter: &egui::Painter, c: egui::Pos2, dir: Option<&str>| {
+        let arm = 9.0_f32;
+        let tip = 26.0_f32;
+        for &d in &["up", "down", "left", "right"] {
+            let active = dir == Some(d);
+            let col = if active { egui::Color32::WHITE } else { egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200) };
+            let cs = egui::Stroke::new(2.5, col);
+            let (px, py) = match d {
+                "up"   => (c.x, c.y - tip),
+                "down" => (c.x, c.y + tip),
+                "left" => (c.x - tip, c.y),
+                _      => (c.x + tip, c.y),
+            };
+            let tp = egui::pos2(px, py);
+            let (a, b) = match d {
+                "up"   => (egui::pos2(px - arm, py + arm * 0.65), egui::pos2(px + arm, py + arm * 0.65)),
+                "down" => (egui::pos2(px - arm, py - arm * 0.65), egui::pos2(px + arm, py - arm * 0.65)),
+                "left" => (egui::pos2(px + arm * 0.65, py - arm), egui::pos2(px + arm * 0.65, py + arm)),
+                _      => (egui::pos2(px - arm * 0.65, py - arm), egui::pos2(px - arm * 0.65, py + arm)),
+            };
+            painter.line_segment([a, tp], cs);
+            painter.line_segment([tp, b], cs);
+        }
+    };
+
+    // Standard circular d-pad — 110×110, returns (up, dn, lt, rt).
+    let dpad = |ui: &mut egui::Ui| -> (bool, bool, bool, bool) {
+        let size = 110.0_f32;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
+        let mut dir: Option<&str> = None;
+        if ui.is_rect_visible(rect) {
+            let c = rect.center();
+            let radius = size / 2.0 - 2.0;
+            if resp.is_pointer_button_down_on() {
+                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    let dx = pos.x - c.x;
+                    let dy = pos.y - c.y;
+                    dir = Some(if dy.abs() > dx.abs() {
+                        if dy < 0.0 { "up" } else { "down" }
+                    } else {
+                        if dx < 0.0 { "left" } else { "right" }
+                    });
+                }
+            }
+            let painter = ui.painter();
+            painter.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(110, 10, 10, 110));
+            draw_dpad_circle(painter, c, dir);
+        }
+        (dir == Some("up"), dir == Some("down"), dir == Some("left"), dir == Some("right"))
+    };
+
+    // Wide button for Tilt/Altitude/Zoom.
     let wbtn = |ui: &mut egui::Ui, label: &str, active: bool| -> egui::Response {
         let (bg, stroke, fg) = if active {
             (active_fill, active_stroke, egui::Color32::WHITE)
         } else {
-            (btn_fill, btn_stroke, lbl_col)
+            (egui::Color32::from_rgba_unmultiplied(12, 14, 22, 160), btn_stroke, lbl_col)
         };
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 28.0), egui::Sense::click_and_drag());
         if ui.is_rect_visible(rect) {
@@ -506,13 +525,6 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
         resp
     };
 
-    // Tiny uppercase caption above each pod.
-    let pod_lbl = |ui: &mut egui::Ui, text: &str| {
-        ui.label(egui::RichText::new(text).size(7.0)
-            .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 77)).strong());
-    };
-
-    // egui::Window shrink-wraps to content (unlike Area which expands to full viewport).
     egui::Window::new("__gamepad__")
         .id(egui::Id::new("gpad_win"))
         .title_bar(false)
@@ -524,143 +536,147 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
 
-            // ── Row 1: MOVE CAMERA  +  ROTATE CAMERA ─────────────────────
+            // ── Row 1: MOVE CAMERA · ROTATE CAMERA · MOVE TARGET ──────────
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(12.0, 0.0);
+                ui.spacing_mut().item_spacing = egui::vec2(20.0, 0.0);
 
-                // MOVE CAMERA  (W / A / S / D)
-                // D-pad cross: each row = [30sp] [btn] [30sp] so all rows are
-                // identical 96px wide (3 × 30 + 2 × 3px gap) and ▲/▼ are
-                // centred over the gap between ◀ and ▶.
-                egui::Frame::new().fill(panel_fill).corner_radius(rounding14)
-                    .inner_margin(egui::Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                        pod_lbl(ui, "MOVE CAMERA");
-                        ui.horizontal(|ui| { // [sp] [▲] [sp]
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "up", ctrl.move_forward);
-                            ctrl.process_keyboard(KeyCode::KeyW, r.is_pointer_button_down_on());
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                        });
-                        ui.horizontal(|ui| { // [◀] [sp] [▶]
-                            let r = btn(ui, "left", ctrl.move_left);
-                            ctrl.process_keyboard(KeyCode::KeyA, r.is_pointer_button_down_on());
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "right", ctrl.move_right);
-                            ctrl.process_keyboard(KeyCode::KeyD, r.is_pointer_button_down_on());
-                        });
-                        ui.horizontal(|ui| { // [sp] [▼] [sp]
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "down", ctrl.move_backward);
-                            ctrl.process_keyboard(KeyCode::KeyS, r.is_pointer_button_down_on());
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                        });
-                    });
+                // ── MOVE CAMERA  (W/A/S/D) — eye icon in center ───────────
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+                    pod_lbl(ui, "MOVE CAMERA");
+                    let size = 110.0_f32;
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
+                    let mut dir: Option<&str> = None;
+                    if ui.is_rect_visible(rect) {
+                        let c = rect.center();
+                        let radius = size / 2.0 - 2.0;
+                        if resp.is_pointer_button_down_on() {
+                            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                let dx = pos.x - c.x;
+                                let dy = pos.y - c.y;
+                                dir = Some(if dy.abs() > dx.abs() {
+                                    if dy < 0.0 { "up" } else { "down" }
+                                } else {
+                                    if dx < 0.0 { "left" } else { "right" }
+                                });
+                            }
+                        }
+                        let painter = ui.painter();
+                        painter.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(110, 10, 10, 110));
+                        draw_dpad_circle(painter, c, dir);
+                    }
+                    ctrl.process_keyboard(KeyCode::KeyW, dir == Some("up"));
+                    ctrl.process_keyboard(KeyCode::KeyS, dir == Some("down"));
+                    ctrl.process_keyboard(KeyCode::KeyA, dir == Some("left"));
+                    ctrl.process_keyboard(KeyCode::KeyD, dir == Some("right"));
+                });
 
-                // ROTATE CAMERA  (Arrow keys)
-                egui::Frame::new().fill(panel_fill).corner_radius(rounding14)
-                    .inner_margin(egui::Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                        pod_lbl(ui, "ROTATE CAMERA");
-                        ui.horizontal(|ui| { // [sp] [▲] [sp]
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "up", false);
-                            if r.is_pointer_button_down_on() { ctrl.rotation.y += 2.0; ctrl.user_inptut = true; }
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                        });
-                        ui.horizontal(|ui| { // [◀] [sp] [▶]
-                            let r = btn(ui, "left", false);
-                            if r.is_pointer_button_down_on() { ctrl.rotation.x -= 2.0; ctrl.user_inptut = true; }
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "right", false);
-                            if r.is_pointer_button_down_on() { ctrl.rotation.x += 2.0; ctrl.user_inptut = true; }
-                        });
-                        ui.horizontal(|ui| { // [sp] [▼] [sp]
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "down", false);
-                            if r.is_pointer_button_down_on() { ctrl.rotation.y -= 2.0; ctrl.user_inptut = true; }
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                        });
-                    });
+                // ── ROTATE CAMERA  (rotation) — camera icon in center ─────
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+                    pod_lbl(ui, "ROTATE CAMERA");
+                    let size = 110.0_f32;
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
+                    let mut dir: Option<&str> = None;
+                    if ui.is_rect_visible(rect) {
+                        let c = rect.center();
+                        let radius = size / 2.0 - 2.0;
+                        if resp.is_pointer_button_down_on() {
+                            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                let dx = pos.x - c.x;
+                                let dy = pos.y - c.y;
+                                dir = Some(if dy.abs() > dx.abs() {
+                                    if dy < 0.0 { "up" } else { "down" }
+                                } else {
+                                    if dx < 0.0 { "left" } else { "right" }
+                                });
+                            }
+                        }
+                        let painter = ui.painter();
+                        painter.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(110, 10, 10, 110));
+                        draw_dpad_circle(painter, c, dir);
+                        // Camera icon
+                        let cam_w = 28.0_f32;
+                        let cam_h = 16.0_f32;
+                        let cam_rect = egui::Rect::from_center_size(c, egui::vec2(cam_w, cam_h));
+                        let body_col = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180);
+                        ui.painter().rect(cam_rect, 3.0, body_col, egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Inside);
+                        ui.painter().circle_filled(c, 5.0, egui::Color32::from_rgba_unmultiplied(110, 10, 10, 220));
+                        let vf = egui::Rect::from_center_size(
+                            egui::pos2(c.x - cam_w * 0.25, c.y - cam_h * 0.6),
+                            egui::vec2(7.0, 5.0),
+                        );
+                        ui.painter().rect_filled(vf, 1.0, body_col);
+                    }
+                    if dir == Some("up")    { ctrl.rotation.y += 2.0; ctrl.user_inptut = true; }
+                    if dir == Some("down")  { ctrl.rotation.y -= 2.0; ctrl.user_inptut = true; }
+                    if dir == Some("left")  { ctrl.rotation.x -= 2.0; ctrl.user_inptut = true; }
+                    if dir == Some("right") { ctrl.rotation.x += 2.0; ctrl.user_inptut = true; }
+                });
+
+                // ── MOVE TARGET  (shift) ───────────────────────────────────
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+                    pod_lbl(ui, "MOVE TARGET");
+                    let (up, dn, lt, rt) = dpad(ui);
+                    if up { ctrl.shift.x += 1.0; ctrl.user_inptut = true; }
+                    if dn { ctrl.shift.x -= 1.0; ctrl.user_inptut = true; }
+                    if lt { ctrl.shift.y -= 1.0; ctrl.user_inptut = true; }
+                    if rt { ctrl.shift.y += 1.0; ctrl.user_inptut = true; }
+                });
             });
 
-            // ── Row 2: TILT · ALTITUDE · ZOOM · MOVE TARGET ───────────────
+            // ── Row 2: TILT · ALTITUDE · ZOOM ─────────────────────────────
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
 
                 // TILT CAMERA  (Z / X)
-                egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
-                    .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                        pod_lbl(ui, "TILT CAMERA");
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                            let r = wbtn(ui, "< Z", ctrl.roll_left);
-                            ctrl.process_keyboard(KeyCode::KeyZ, r.is_pointer_button_down_on());
-                            let r = wbtn(ui, "X >", ctrl.roll_right);
-                            ctrl.process_keyboard(KeyCode::KeyX, r.is_pointer_button_down_on());
+                ui.vertical(|ui| {
+                    pod_lbl(ui, "TILT CAMERA");
+                    egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
+                        .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                let r = wbtn(ui, "< Z", ctrl.roll_left);
+                                ctrl.process_keyboard(KeyCode::KeyZ, r.is_pointer_button_down_on());
+                                let r = wbtn(ui, "X >", ctrl.roll_right);
+                                ctrl.process_keyboard(KeyCode::KeyX, r.is_pointer_button_down_on());
+                            });
                         });
-                    });
+                });
 
                 // ALTITUDE  (E = Up, Q = Down)
-                egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
-                    .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                        pod_lbl(ui, "ALTITUDE");
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                            let r = wbtn(ui, "Up", ctrl.move_up);
-                            ctrl.process_keyboard(KeyCode::KeyE, r.is_pointer_button_down_on());
-                            let r = wbtn(ui, "Dn", ctrl.move_down);
-                            ctrl.process_keyboard(KeyCode::KeyQ, r.is_pointer_button_down_on());
+                ui.vertical(|ui| {
+                    pod_lbl(ui, "ALTITUDE");
+                    egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
+                        .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                let r = wbtn(ui, "Up", ctrl.move_up);
+                                ctrl.process_keyboard(KeyCode::KeyE, r.is_pointer_button_down_on());
+                                let r = wbtn(ui, "Dn", ctrl.move_down);
+                                ctrl.process_keyboard(KeyCode::KeyQ, r.is_pointer_button_down_on());
+                            });
                         });
-                    });
+                });
 
                 // ZOOM
-                egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
-                    .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                        pod_lbl(ui, "ZOOM");
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                            let r = wbtn(ui, "+", false);
-                            if r.is_pointer_button_down_on() { ctrl.process_scroll(3.0); }
-                            let r = wbtn(ui, "-", false);
-                            if r.is_pointer_button_down_on() { ctrl.process_scroll(-3.0); }
+                ui.vertical(|ui| {
+                    pod_lbl(ui, "ZOOM");
+                    egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
+                        .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                let r = wbtn(ui, "+", false);
+                                if r.is_pointer_button_down_on() { ctrl.process_scroll(3.0); }
+                                let r = wbtn(ui, "-", false);
+                                if r.is_pointer_button_down_on() { ctrl.process_scroll(-3.0); }
+                            });
                         });
-                    });
-
-                // MOVE TARGET  (same cross pattern as d-pads)
-                egui::Frame::new().fill(panel_fill).corner_radius(rounding12)
-                    .inner_margin(egui::Margin { left: 10, right: 10, top: 7, bottom: 7 })
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                        pod_lbl(ui, "MOVE TARGET");
-                        ui.horizontal(|ui| { // [sp] [▲] [sp]
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "up", false);
-                            if r.is_pointer_button_down_on() { ctrl.shift.x += 1.0; ctrl.user_inptut = true; }
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                        });
-                        ui.horizontal(|ui| { // [◀] [sp] [▶]
-                            let r = btn(ui, "left", false);
-                            if r.is_pointer_button_down_on() { ctrl.shift.y -= 1.0; ctrl.user_inptut = true; }
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "right", false);
-                            if r.is_pointer_button_down_on() { ctrl.shift.y += 1.0; ctrl.user_inptut = true; }
-                        });
-                        ui.horizontal(|ui| { // [sp] [▼] [sp]
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "down", false);
-                            if r.is_pointer_button_down_on() { ctrl.shift.x -= 1.0; ctrl.user_inptut = true; }
-                            let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                        });
-                    });
+                });
             });
 
             // ── Hint ──────────────────────────────────────────────────────

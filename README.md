@@ -82,3 +82,11 @@ Move Target mini D-pad	I / J / K / L
 
 cargo check --target wasm32-unknown-unknown --lib 2>&1 | Select-String -Pattern "^error|^warning.*unused|Finished|^error\[" | Select-Object -Last 30
 cargo check --target wasm32-unknown-unknown --lib 2>&1 | Tee-Object -Variable out ; $out | Select-String "error|Finished" | Select-Object -Last 20
+
+
+
+"Move Camera" and "Move Target" are different controls in your 3D viewer:
+
+Move Camera: Moves the camera's position in the 3D world (W/A/S/D = forward/left/back/right). The camera itself moves, so your viewpoint changes, but the point you are looking at (the target) may move with you or stay fixed depending on the camera mode.
+
+Move Target: Moves the "target" or "center" point that the camera is looking at, without moving the camera's position. This shifts what the camera is focused on, like panning the center of rotation or interest, but the camera stays in place.
