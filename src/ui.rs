@@ -450,7 +450,7 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
     let rounding12    = egui::CornerRadius::same(12);
 
     // 30×30 square button — custom-drawn, active state shown in blue.
-    let btn = |ui: &mut egui::Ui, label: &str, active: bool| -> egui::Response {
+    let btn = |ui: &mut egui::Ui, dir: &str, active: bool| -> egui::Response {
         let (bg, stroke, fg) = if active {
             (active_fill, active_stroke, egui::Color32::WHITE)
         } else {
@@ -459,7 +459,34 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click_and_drag());
         if ui.is_rect_visible(rect) {
             ui.painter().rect(rect, egui::CornerRadius::same(8), bg, stroke, egui::StrokeKind::Inside);
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), fg);
+            let c = rect.center();
+            let s = 7.0_f32;
+            let points = match dir {
+                "up" => vec![
+                    egui::pos2(c.x, c.y - s),
+                    egui::pos2(c.x + s, c.y + s * 0.7),
+                    egui::pos2(c.x - s, c.y + s * 0.7),
+                ],
+                "down" => vec![
+                    egui::pos2(c.x, c.y + s),
+                    egui::pos2(c.x + s, c.y - s * 0.7),
+                    egui::pos2(c.x - s, c.y - s * 0.7),
+                ],
+                "left" => vec![
+                    egui::pos2(c.x - s, c.y),
+                    egui::pos2(c.x + s * 0.7, c.y - s),
+                    egui::pos2(c.x + s * 0.7, c.y + s),
+                ],
+                "right" => vec![
+                    egui::pos2(c.x + s, c.y),
+                    egui::pos2(c.x - s * 0.7, c.y - s),
+                    egui::pos2(c.x - s * 0.7, c.y + s),
+                ],
+                _ => vec![],
+            };
+            if !points.is_empty() {
+                ui.painter().add(egui::Shape::convex_polygon(points, fg, egui::Stroke::NONE));
+            }
         }
         resp
     };
@@ -512,20 +539,20 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
                         pod_lbl(ui, "MOVE CAMERA");
                         ui.horizontal(|ui| { // [sp] [▲] [sp]
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "▲", ctrl.move_forward);
+                            let r = btn(ui, "up", ctrl.move_forward);
                             ctrl.process_keyboard(KeyCode::KeyW, r.is_pointer_button_down_on());
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
                         ui.horizontal(|ui| { // [◀] [sp] [▶]
-                            let r = btn(ui, "◀", ctrl.move_left);
+                            let r = btn(ui, "left", ctrl.move_left);
                             ctrl.process_keyboard(KeyCode::KeyA, r.is_pointer_button_down_on());
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "▶", ctrl.move_right);
+                            let r = btn(ui, "right", ctrl.move_right);
                             ctrl.process_keyboard(KeyCode::KeyD, r.is_pointer_button_down_on());
                         });
                         ui.horizontal(|ui| { // [sp] [▼] [sp]
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "▼", ctrl.move_backward);
+                            let r = btn(ui, "down", ctrl.move_backward);
                             ctrl.process_keyboard(KeyCode::KeyS, r.is_pointer_button_down_on());
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
@@ -539,20 +566,20 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
                         pod_lbl(ui, "ROTATE CAMERA");
                         ui.horizontal(|ui| { // [sp] [▲] [sp]
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "▲", false);
+                            let r = btn(ui, "up", false);
                             if r.is_pointer_button_down_on() { ctrl.rotation.y += 2.0; ctrl.user_inptut = true; }
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
                         ui.horizontal(|ui| { // [◀] [sp] [▶]
-                            let r = btn(ui, "◀", false);
+                            let r = btn(ui, "left", false);
                             if r.is_pointer_button_down_on() { ctrl.rotation.x -= 2.0; ctrl.user_inptut = true; }
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "▶", false);
+                            let r = btn(ui, "right", false);
                             if r.is_pointer_button_down_on() { ctrl.rotation.x += 2.0; ctrl.user_inptut = true; }
                         });
                         ui.horizontal(|ui| { // [sp] [▼] [sp]
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "▼", false);
+                            let r = btn(ui, "down", false);
                             if r.is_pointer_button_down_on() { ctrl.rotation.y -= 2.0; ctrl.user_inptut = true; }
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
@@ -616,20 +643,20 @@ fn gamepad_panel(ctx: &egui::Context, ctrl: &mut CameraController) {
                         pod_lbl(ui, "MOVE TARGET");
                         ui.horizontal(|ui| { // [sp] [▲] [sp]
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "▲", false);
+                            let r = btn(ui, "up", false);
                             if r.is_pointer_button_down_on() { ctrl.shift.x += 1.0; ctrl.user_inptut = true; }
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
                         ui.horizontal(|ui| { // [◀] [sp] [▶]
-                            let r = btn(ui, "◀", false);
+                            let r = btn(ui, "left", false);
                             if r.is_pointer_button_down_on() { ctrl.shift.y -= 1.0; ctrl.user_inptut = true; }
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "▶", false);
+                            let r = btn(ui, "right", false);
                             if r.is_pointer_button_down_on() { ctrl.shift.y += 1.0; ctrl.user_inptut = true; }
                         });
                         ui.horizontal(|ui| { // [sp] [▼] [sp]
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                            let r = btn(ui, "▼", false);
+                            let r = btn(ui, "down", false);
                             if r.is_pointer_button_down_on() { ctrl.shift.x -= 1.0; ctrl.user_inptut = true; }
                             let _ = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                         });
