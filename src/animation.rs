@@ -4,7 +4,7 @@ use std::time::Duration;
 #[cfg(target_arch = "wasm32")]
 use web_time::Duration;
 
-use cgmath::{EuclideanSpace, InnerSpace, Point3, Quaternion, Rad, VectorSpace};
+use cgmath::{EuclideanSpace, InnerSpace, Matrix3, MetricSpace, Point3, Quaternion, Rad, Rotation3, Vector3, VectorSpace};
 
 use crate::{PerspectiveProjection, camera::PerspectiveCamera};
 
@@ -293,4 +293,133 @@ fn unroll(rot: [Quaternion<f32>; 4]) -> [Quaternion<f32>; 4] {
         }
     }
     return rot;
+}
+
+// ── Cinematic Pan ─────────────────────────────────────────────────────────────
+//
+// A looping, oscillating camera orbit that plays automatically on first load.
+// The camera slowly sweeps left-to-right (yaw) and breathes slightly up-down
+// (pitch) around the scene centroid, using a sine wave for perfectly smooth,
+// natural-feeling movement.
+//
+// Plugs directly into the existing `Animation<PerspectiveCamera>` machinery:
+//   let sampler = CinematicPan::new(...);
+//   let anim = Animation::new(Duration::from_secs(10), true, Box::new(sampler));
+//   state.animation = Some((anim, true));
+//
+// The animation is cancelled automatically the moment `controller.user_inptut`
+// becomes true (mouse click, key press, touch, scroll) — see `update()` in lib.rs.
+
+/// Smooth left-right (and subtle up-down) orbiting camera for cinematic intros.
+pub struct CinematicPan {
+    /// Frozen reference camera at the moment cinematic mode begins.
+    initial_camera: PerspectiveCamera,
+    /// Scene centroid — the point the camera always faces.
+    centroid: Point3<f32>,
+    /// World "up" direction (normalised).  Used as the yaw rotation axis.
+    world_up: Vector3<f32>,
+    /// Maximum horizontal sweep in radians (e.g. 0.35 ≈ ±20°).
+    max_yaw_rad: f32,
+    /// Maximum vertical lift as a fraction of orbit distance (e.g. 0.08 ≈ 8%).
+    max_pitch_frac: f32,
+    /// Distance from initial eye to centroid.
+    orbit_distance: f32,
+}
+
+impl CinematicPan {
+    /// Create a new cinematic pan sampler.
+    ///
+    /// * `initial_camera`  – camera state at the moment the pan begins
+    /// * `centroid`        – the world-space point the camera always looks toward
+    /// * `world_up`        – world up direction (from `PointCloud::up()`)
+    /// * `max_yaw_deg`     – horizontal sweep half-width in degrees (recommend 15–25)
+    /// * `max_pitch_frac`  – vertical breathing, fraction of orbit radius (recommend 0.05–0.10)
+    pub fn new(
+        initial_camera: PerspectiveCamera,
+        centroid: Point3<f32>,
+        world_up: Vector3<f32>,
+        max_yaw_deg: f32,
+        max_pitch_frac: f32,
+    ) -> Self {
+        let orbit_distance = initial_camera.position.distance(centroid);
+        // Fall back to -Y if the scene has no stored up vector.
+        let world_up = if world_up.magnitude2() < 1e-6 {
+            Vector3::new(0.0, -1.0, 0.0)
+        } else {
+            world_up.normalize()
+        };
+        Self {
+            initial_camera,
+            centroid,
+            world_up,
+            max_yaw_rad: max_yaw_deg.to_radians(),
+            max_pitch_frac,
+            orbit_distance,
+        }
+    }
+}
+
+impl Sampler for CinematicPan {
+    type Sample = PerspectiveCamera;
+
+    /// `v` = animation progress 0.0..1.0 (loops).
+    /// One full sin oscillation (left → centre → right → centre) per period.
+    fn sample(&self, v: f32) -> PerspectiveCamera {
+        use std::f32::consts::TAU;
+
+        // ── 1. Compute new eye position ───────────────────────────────────────
+        // Main horizontal sweep: one full sine cycle per animation period.
+        let yaw_angle = self.max_yaw_rad * (v * TAU).sin();
+        // Subtle vertical breathing at half frequency so it never lines up
+        // with the horizontal extremes — keeps the motion feeling organic.
+        let pitch_lift = self.max_pitch_frac * (v * TAU * 0.5).sin();
+
+        // Orbit the initial offset vector around the world_up axis.
+        let orbit_offset = self.initial_camera.position - self.centroid;
+        let yaw_q = Quaternion::from_axis_angle(self.world_up, Rad(yaw_angle));
+        let mut new_offset = yaw_q * orbit_offset;
+
+        // Add vertical displacement proportional to orbit distance.
+        new_offset += self.world_up * (pitch_lift * self.orbit_distance);
+
+        let new_eye = self.centroid + new_offset;
+
+        // ── 2. Build look-at rotation: camera faces centroid from new_eye ─────
+        let forward = (self.centroid - new_eye).normalize();
+
+        // screen_down_approx: the camera's +Y axis in world space.
+        // In the GS coordinate convention (+Z forward, +Y screen-down) this is
+        // the negation of the world up vector.
+        let screen_down_approx = -self.world_up;
+
+        // Derive orthonormal camera right and up vectors.
+        let right = {
+            let r = screen_down_approx.cross(forward);
+            if r.magnitude2() < 1e-6 {
+                // Gimbal lock: forward is parallel to world_up.
+                // Fall back to the initial camera's right vector.
+                self.initial_camera.rotation.conjugate() * Vector3::unit_x()
+            } else {
+                r.normalize()
+            }
+        };
+        // Camera +Y = forward × right (ensures right-handed frame, det = +1).
+        let cam_y = forward.cross(right);
+
+        // Build the world-to-camera rotation matrix (rows = camera axes).
+        // cgmath Matrix3 is column-major; transposing the [right|cam_y|forward]
+        // matrix gives us the correct R such that R * forward = unit_z, etc.
+        let rot_mat = Matrix3::from_cols(
+            Vector3::new(right.x,   cam_y.x,  forward.x),  // col 0
+            Vector3::new(right.y,   cam_y.y,  forward.y),  // col 1
+            Vector3::new(right.z,   cam_y.z,  forward.z),  // col 2
+        );
+        let new_rotation = Quaternion::from(rot_mat);
+
+        PerspectiveCamera {
+            position: new_eye,
+            rotation: new_rotation,
+            projection: self.initial_camera.projection,
+        }
+    }
 }

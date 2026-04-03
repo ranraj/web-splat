@@ -31,7 +31,7 @@ use winit::{
 
 mod animation;
 mod ui;
-pub use animation::{Animation, Sampler, TrackingShot, Transition};
+pub use animation::{Animation, CinematicPan, Sampler, TrackingShot, Transition};
 mod camera;
 pub use camera::{Camera, PerspectiveCamera, PerspectiveProjection};
 mod controller;
@@ -407,6 +407,12 @@ impl WindowContext {
                 Err(e) => log::warn!("could not load scene on reload: {:?}", e),
             }
         }
+
+        // Auto-start the cinematic intro pan so the scene feels alive on first load.
+        // 10-second period, ±18° horizontal sweep.
+        // Stops immediately when the user clicks, touches, scrolls, or presses a key.
+        self.start_cinematic_pan(10.0, 18.0);
+
         Ok(())
     }
 
@@ -641,6 +647,36 @@ impl WindowContext {
         }
     }
 
+    /// Starts the cinematic intro animation — a smooth sine-wave pan around
+    /// the scene centroid.  Automatically stops the moment the user interacts
+    /// (mouse, touch, keyboard, scroll) via the existing `user_inptut` flag.
+    ///
+    /// * `period_secs` — duration of one full left-right cycle (recommend 8–12).
+    /// * `yaw_deg`     — horizontal sweep half-width in degrees (recommend 15–22).
+    fn start_cinematic_pan(&mut self, period_secs: f32, yaw_deg: f32) {
+        // Reset user-input flag so a previous interaction doesn't immediately
+        // cancel the animation we are about to start.
+        self.controller.user_inptut = false;
+
+        let centroid = self.controller.center;
+        let world_up = self.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
+
+        let sampler = CinematicPan::new(
+            self.splatting_args.camera,
+            centroid,
+            world_up,
+            yaw_deg,
+            0.06, // subtle vertical breathing: 6% of orbit radius
+        );
+
+        let anim = Animation::new(
+            Duration::from_secs_f32(period_secs),
+            true, // looping — continues until user interacts
+            Box::new(sampler),
+        );
+        self.animation = Some((anim, true));
+    }
+
     fn cancle_animation(&mut self) {
         self.animation.take();
         self.controller.reset_to_camera(self.splatting_args.camera);
@@ -824,6 +860,10 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
 
     let mut last = Instant::now();
 
+    // Auto-start the cinematic intro pan so the scene feels alive on first load.
+    // Stops immediately the moment the user clicks, touches, scrolls, or presses a key.
+    state.start_cinematic_pan(10.0, 18.0);
+
     #[allow(deprecated)]
     event_loop.run(move |event,target| {
         // Stop this event loop if a newer render has been started
@@ -869,6 +909,16 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                     centroid,
                     radius
                 );
+                state.window.request_redraw();
+            }
+
+            // Check if JS called start_cinematic_pan_wasm() or stop_cinematic_pan_wasm().
+            if let Some(start) = PENDING_CINEMATIC.with(|cell| cell.borrow_mut().take()) {
+                if start {
+                    state.start_cinematic_pan(10.0, 18.0);
+                } else {
+                    state.cancle_animation();
+                }
                 state.window.request_redraw();
             }
         }
@@ -1042,6 +1092,14 @@ thread_local! {
         std::cell::RefCell::new(false);
 }
 
+/// Signal from JS to start (true) or stop (false) the cinematic pan animation.
+/// `None` means no pending request this frame.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_CINEMATIC: std::cell::RefCell<Option<bool>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Caches [cx, cy, cz, radius] for the currently loaded point cloud so that
 /// `get_scene_bounds()` can return them synchronously from JS.
 #[cfg(target_arch = "wasm32")]
@@ -1083,6 +1141,34 @@ pub fn auto_center_camera() {
 pub fn auto_frame_scene() {
     PENDING_AUTO_CENTER.with(|cell| {
         *cell.borrow_mut() = true;
+    });
+}
+
+/// Starts the cinematic intro pan from JavaScript.
+///
+/// The camera smoothly oscillates left-to-right around the scene centroid with
+/// a 10-second period and ±18° horizontal sweep.  The animation loops until
+/// stopped by the user (any click, touch, key, or scroll) or until
+/// `stop_cinematic_pan_wasm()` is called explicitly.
+///
+/// Safe to call at any time — replaces any currently running animation.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn start_cinematic_pan_wasm() {
+    PENDING_CINEMATIC.with(|cell| {
+        *cell.borrow_mut() = Some(true);
+    });
+}
+
+/// Stops the cinematic pan and hands control back to the user.
+///
+/// Call this if your UI wants to explicitly end the intro before the user
+/// interacts — e.g. after an overlay is dismissed.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn stop_cinematic_pan_wasm() {
+    PENDING_CINEMATIC.with(|cell| {
+        *cell.borrow_mut() = Some(false);
     });
 }
 
