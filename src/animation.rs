@@ -4,7 +4,7 @@ use std::time::Duration;
 #[cfg(target_arch = "wasm32")]
 use web_time::Duration;
 
-use cgmath::{EuclideanSpace, InnerSpace, Matrix3, MetricSpace, Point3, Quaternion, Rad, Rotation3, Vector3, VectorSpace};
+use cgmath::{EuclideanSpace, InnerSpace, MetricSpace, Point3, Quaternion, Rad, Rotation, Rotation3, Vector3, VectorSpace};
 
 use crate::{PerspectiveProjection, camera::PerspectiveCamera};
 
@@ -384,37 +384,12 @@ impl Sampler for CinematicPan {
 
         let new_eye = self.centroid + new_offset;
 
-        // ── 2. Build look-at rotation: camera faces centroid from new_eye ─────
+        // ── 2. Build look-at rotation ───────────────────────────────────────
+        // Use the same Quaternion::look_at convention the orbit controller uses
+        // so the handoff from animation → interactive orbit is seamless:
+        //   look_at(forward, up)  where forward = eye → centroid.
         let forward = (self.centroid - new_eye).normalize();
-
-        // screen_down_approx: the camera's +Y axis in world space.
-        // In the GS coordinate convention (+Z forward, +Y screen-down) this is
-        // the negation of the world up vector.
-        let screen_down_approx = -self.world_up;
-
-        // Derive orthonormal camera right and up vectors.
-        let right = {
-            let r = screen_down_approx.cross(forward);
-            if r.magnitude2() < 1e-6 {
-                // Gimbal lock: forward is parallel to world_up.
-                // Fall back to the initial camera's right vector.
-                self.initial_camera.rotation.conjugate() * Vector3::unit_x()
-            } else {
-                r.normalize()
-            }
-        };
-        // Camera +Y = forward × right (ensures right-handed frame, det = +1).
-        let cam_y = forward.cross(right);
-
-        // Build the world-to-camera rotation matrix (rows = camera axes).
-        // cgmath Matrix3 is column-major; transposing the [right|cam_y|forward]
-        // matrix gives us the correct R such that R * forward = unit_z, etc.
-        let rot_mat = Matrix3::from_cols(
-            Vector3::new(right.x,   cam_y.x,  forward.x),  // col 0
-            Vector3::new(right.y,   cam_y.y,  forward.y),  // col 1
-            Vector3::new(right.z,   cam_y.z,  forward.z),  // col 2
-        );
-        let new_rotation = Quaternion::from(rot_mat);
+        let new_rotation = Quaternion::look_at(forward, self.world_up);
 
         PerspectiveCamera {
             position: new_eye,

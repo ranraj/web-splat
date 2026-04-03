@@ -11,9 +11,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_arch = "wasm32")]
 use web_time::{Duration, Instant};
 
-use cgmath::{Deg, EuclideanSpace, Point3, Quaternion, UlpsEq, Vector2, Vector3};
+use cgmath::{Deg, EuclideanSpace, Point3, Quaternion, Rotation, UlpsEq, Vector2, Vector3};
 use egui::FullOutput;
-use num_traits::One;
 
 #[cfg(not(target_arch = "wasm32"))]
 use utils::RingBuffer;
@@ -246,26 +245,23 @@ impl WindowContext {
         //               Marble WorldLabs reference viewer.
         //
         //   near plane = 0.005  (half the old 0.01) so close-by splats are not clipped.
-        let world_up = pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
-        // Lower initial camera pullback by 20% and altitude by 10%
-        let back_dist = radius * 0.12; // was 0.16 → 25% lower
-        let eye_rise  = radius * 0.063; // was 0.07 → 10% lower (0.07 * 0.9 = 0.063)
-        let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
-        // Derive init_pitch from the scene's floor tilt angle so the camera sits
-        // perpendicular to the floor on load. world_up.y = cos(floor_tilt), so
-        // acos(world_up.y) gives the angle the floor normal deviates from vertical.
-        // Falls back to 0 when the scene is too small to detect a floor plane.
-        let init_pitch = if pc.up().is_some() { world_up.y.acos() } else { 0.0_f32 };
-        let (sp, cp) = init_pitch.sin_cos();
-        let camera_offset = Vector3::new(
-            camera_offset.x,
-            camera_offset.y * cp - camera_offset.z * sp,
-            camera_offset.y * sp + camera_offset.z * cp,
-        );
+        // ── Robust scene-up detection ──────────────────────────────────────
+        // Strategy: use the AABB shortest axis as the "up" direction (rooms are
+        // always wider & deeper than tall).  If PCA also found a floor plane
+        // that agrees (within 45°), prefer the PCA result for sub-degree
+        // accuracy.  Otherwise fall back to the AABB axis.
+        let world_up = robust_scene_up(&pc);
+        let back_dist = radius * 0.12;
+        let eye_rise  = radius * 0.063;
+        // Look direction: project +Z onto the floor (perpendicular to up).
+        let look_dir = floor_projected_direction(Vector3::unit_z(), world_up);
+        let camera_offset = -look_dir * back_dist + world_up * eye_rise;
+        // Quaternion::look_at(forward, up): +Z → forward, +Y → up.
+        // This matches the orbit controller's convention exactly.
+        let camera_rotation = Quaternion::look_at(look_dir, world_up);
         let view_camera = PerspectiveCamera::new(
             centroid + camera_offset,
-            // Identity rotation: camera looks in +Z — straight into the room interior.
-            Quaternion::one(),
+            camera_rotation,
             PerspectiveProjection::new(
                 Vector2::new(size.width, size.height),
                 // 60 ° horizontal FOV for a natural room-scale perspective.
@@ -278,9 +274,9 @@ impl WindowContext {
         let mut controller = CameraController::new(0.1, 0.05);
         // Orbit center = statistical centroid so every drag pivots around the scene.
         controller.center = centroid;
-        // Set the stable orbit axis from the scene's best-fit plane normal.  This keeps
-        // the horizon level during 360° horizontal rotation and prevents gimbal flip.
-        controller.up = pc.up();
+        // Set the stable orbit axis from the robust scene-up so the horizon
+        // stays level during 360° rotation.
+        controller.up = Some(world_up);
 
         // Cache scene bounds so JS can read them via get_scene_bounds() at any time.
         #[cfg(target_arch = "wasm32")]
@@ -378,21 +374,16 @@ impl WindowContext {
         // Auto-frame using the same interior-placement formula as WindowContext::new().
         // See the detailed comment there for the derivation.
         let (centroid, radius) = self.pc.centroid_and_radius();
-        let world_up = self.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
+        let world_up = robust_scene_up(&self.pc);
         let back_dist = radius * 0.12;
         let eye_rise  = radius * 0.063;
-        let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
-        let init_pitch = if self.pc.up().is_some() { world_up.y.acos() } else { 0.0_f32 };
-        let (sp, cp) = init_pitch.sin_cos();
-        let camera_offset = Vector3::new(
-            camera_offset.x,
-            camera_offset.y * cp - camera_offset.z * sp,
-            camera_offset.y * sp + camera_offset.z * cp,
-        );
+        let look_dir = floor_projected_direction(Vector3::unit_z(), world_up);
+        let camera_offset = -look_dir * back_dist + world_up * eye_rise;
+        let camera_rotation = Quaternion::look_at(look_dir, world_up);
         let aspect = self.config.width as f32 / self.config.height as f32;
         self.splatting_args.camera = PerspectiveCamera::new(
             centroid + camera_offset,
-            Quaternion::one(),
+            camera_rotation,
             PerspectiveProjection::new(
                 Vector2::new(self.config.width, self.config.height),
                 Vector2::new(Deg(60.0f32), Deg(60.0f32 / aspect)),
@@ -404,7 +395,7 @@ impl WindowContext {
         // Calling reset_to_camera with identity rotation corrupts the controller center
         // (projects it along +Z instead of toward the PC center) causing wrong camera orientation.
         self.controller.center = centroid;
-        self.controller.up = self.pc.up();
+        self.controller.up = Some(world_up);
         // Update the JS-readable bounds cache.
         SCENE_BOUNDS.with(|cell| {
             *cell.borrow_mut() = Some(self.pc.scene_bounds());
@@ -678,7 +669,7 @@ impl WindowContext {
         self.controller.user_inptut = false;
 
         let centroid = self.controller.center;
-        let world_up = self.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
+        let world_up = robust_scene_up(&self.pc);
 
         let sampler = CinematicPan::new(
             self.splatting_args.camera,
@@ -766,6 +757,118 @@ impl WindowContext {
             Vector2::new(self.config.width, self.config.height),
             Split::Test,
         ));
+    }
+}
+
+/// Determine a robust "up" direction for the scene.
+///
+/// **Algorithm** (3-tier):
+///
+/// 1. **AABB shortest axis** — For room-scale captures, rooms are always wider and
+///    deeper than they are tall, so the smallest bounding-box extent reveals the
+///    vertical axis reliably regardless of how many splats sit on walls vs floor.
+///
+/// 2. **PCA consensus** — If `PointCloud::up()` returns a result *and* it agrees
+///    with the AABB axis (≤ 45°), prefer the PCA normal because it has sub-degree
+///    accuracy.  If PCA disagrees (wall-dominant distribution) it is silently
+///    discarded.
+///
+/// 3. **Fallback** — When neither PCA nor a clear shortest axis exist (e.g. a
+///    roughly cubic bounding box), fall back to world −Y (the standard 3DGS /
+///    OpenCV convention where −Y is ceiling-ward).
+///
+/// The sign of the returned vector is chosen so that the +Y component is ≥ 0
+/// when the axis is near Y; otherwise it points toward the positive half of
+/// whatever axis dominates.  This heuristic works because most PLY captures
+/// have the ceiling in the +Y / −Y half-space and the PCA code in `io/mod.rs`
+/// already flips the normal toward +Y.
+fn robust_scene_up(pc: &PointCloud) -> Vector3<f32> {
+    use cgmath::InnerSpace;
+
+    let size = pc.bbox().size();
+    let ax = size.x.abs();
+    let ay = size.y.abs();
+    let az = size.z.abs();
+
+    // Sort extents to find shortest and second-shortest.
+    let mut extents = [(ax, 0u8), (ay, 1u8), (az, 2u8)];
+    extents.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    let shortest_val  = extents[0].0;
+    let shortest_axis = extents[0].1;   // 0=X, 1=Y, 2=Z
+    let second_val    = extents[1].0;
+
+    let aabb_up = match shortest_axis {
+        0 => Vector3::unit_x(),
+        1 => Vector3::unit_y(),
+        _ => Vector3::unit_z(),
+    };
+
+    // AABB is trustworthy when the shortest extent is clearly smaller than the
+    // next one (ratio < 0.85).  For roughly cubic boxes, it's ambiguous.
+    let ratio = if second_val > 1e-6 { shortest_val / second_val } else { 1.0 };
+    let aabb_ok = ratio < 0.85 && shortest_val > 1e-6;
+
+    // PCA result from plane_from_points (computed at load time).
+    let pca_up = pc.up();
+
+    let chosen = if let Some(pca) = pca_up {
+        if aabb_ok {
+            // Both available — use PCA only if it agrees with AABB axis (≤ 45°)
+            if pca.dot(aabb_up).abs() > 0.707 {
+                pca // PCA agrees — use its sub-degree accuracy
+            } else {
+                aabb_up // PCA found a wall — trust AABB
+            }
+        } else {
+            // AABB is ambiguous.  Trust the PCA unconditionally; it's the best
+            // information we have for a roughly cubic scene.
+            pca
+        }
+    } else if aabb_ok {
+        aabb_up
+    } else {
+        // Neither source is usable — the standard Y-down convention means
+        // "screen up" maps to −Y in world.  But most marble PLY files have
+        // the PCA normal near +Y, so +Y is the safest fallback.
+        Vector3::unit_y()
+    };
+
+    // Ensure the up vector points into the positive half of its dominant axis.
+    // The PCA code in io/mod.rs already flips toward +Y, so this is a safety net.
+    let dominant = if chosen.x.abs() > chosen.y.abs() && chosen.x.abs() > chosen.z.abs() {
+        chosen.x
+    } else if chosen.y.abs() > chosen.z.abs() {
+        chosen.y
+    } else {
+        chosen.z
+    };
+    let up = if dominant < 0.0 { -chosen } else { chosen };
+    let up = up.normalize();
+
+    log::info!(
+        "robust_scene_up: bbox_size=({:.3},{:.3},{:.3}) shortest_axis={} ratio={:.3} aabb_ok={} pca={:?} chosen=({:.4},{:.4},{:.4})",
+        ax, ay, az,
+        ['X','Y','Z'][shortest_axis as usize],
+        ratio,
+        aabb_ok,
+        pca_up.map(|v| (v.x, v.y, v.z)),
+        up.x, up.y, up.z,
+    );
+
+    up
+}
+
+/// Project `base_dir` onto the floor plane (perpendicular to `up`) and normalise.
+/// Falls back to +X if `base_dir` is nearly parallel to `up`.
+fn floor_projected_direction(base_dir: Vector3<f32>, up: Vector3<f32>) -> Vector3<f32> {
+    use cgmath::InnerSpace;
+    let proj = base_dir - up * up.dot(base_dir);
+    if proj.magnitude() > 0.1 {
+        proj.normalize()
+    } else {
+        let alt = Vector3::unit_x();
+        (alt - up * up.dot(alt)).normalize()
     }
 }
 
@@ -913,22 +1016,17 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
             if needs_center {
                 // Re-frame using the same interior-placement formula as WindowContext::new().
                 let (centroid, radius) = state.pc.centroid_and_radius();
-                let world_up = state.pc.up().unwrap_or(Vector3::new(0.0, -1.0, 0.0));
+                let world_up = robust_scene_up(&state.pc);
                 let back_dist = radius * 0.12;
                 let eye_rise  = radius * 0.063;
-                let camera_offset = -Vector3::unit_z() * back_dist + world_up * eye_rise;
-                let init_pitch = if state.pc.up().is_some() { world_up.y.acos() } else { 0.0_f32 };
-                let (sp, cp) = init_pitch.sin_cos();
-                let camera_offset = Vector3::new(
-                    camera_offset.x,
-                    camera_offset.y * cp - camera_offset.z * sp,
-                    camera_offset.y * sp + camera_offset.z * cp,
-                );
+                let look_dir = floor_projected_direction(Vector3::unit_z(), world_up);
+                let camera_offset = -look_dir * back_dist + world_up * eye_rise;
+                let camera_rotation = Quaternion::look_at(look_dir, world_up);
                 state.splatting_args.camera.position = centroid + camera_offset;
-                state.splatting_args.camera.rotation = Quaternion::one();
+                state.splatting_args.camera.rotation = camera_rotation;
                 state.splatting_args.camera.fit_near_far(state.pc.bbox());
                 state.controller.center = centroid;
-                state.controller.up = state.pc.up();
+                state.controller.up = Some(world_up);
                 log::info!(
                     "auto_frame_scene: centroid={:?} radius={:.3}",
                     centroid,

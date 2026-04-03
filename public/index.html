@@ -240,6 +240,54 @@
         .navbar-uploader button:hover {
             background: rgba(59,130,246,0.28);
         }
+        .try-demo-wrapper {
+            position: relative;
+            display: inline-block;
+        }
+        .try-demo-btn {
+            appearance: none;
+            border: 1px solid rgba(59,130,246,0.5);
+            border-radius: 8px;
+            background: rgba(59,130,246,0.18);
+            color: #fff;
+            padding: 7px 14px;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: background 0.15s;
+            white-space: nowrap;
+        }
+        .try-demo-btn:hover {
+            background: rgba(59,130,246,0.35);
+        }
+        .demo-dropdown {
+            display: none;
+            position: absolute;
+            top: 110%;
+            right: 0;
+            background: #1a1a1a;
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 8px;
+            min-width: 320px;
+            z-index: 3000;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            padding: 6px 0;
+        }
+        .demo-dropdown.open { display: block; }
+        .demo-dropdown button {
+            display: block;
+            width: 100%;
+            text-align: left;
+            appearance: none;
+            border: none;
+            background: none;
+            color: #fff;
+            padding: 10px 16px;
+            font-size: 0.92rem;
+            cursor: pointer;
+        }
+        .demo-dropdown button:hover {
+            background: rgba(255,255,255,0.08);
+        }
         body {
             padding-top: 64px;
         }
@@ -260,6 +308,14 @@
         <div class="navbar-left">
             <span style="font-weight:700;letter-spacing:1px;">VirtualBhoomi Studio</span>
             <span style="font-size:0.95rem;font-weight:400;opacity:0.7;">Demo Project</span>
+            <div class="try-demo-wrapper">
+                <button class="try-demo-btn" id="try-demo-btn">Try Demo ▾</button>
+                <div class="demo-dropdown" id="demo-dropdown">
+                    <button data-demo="rustic_kitchen_with_natural_light_2m.ply">🍳 Rustic Kitchen</button>
+                    <button data-demo="elegant_library_with_fireplace_2m.ply">📚 Elegant Library</button>
+                    <button data-demo="warm_traditional_kitchen_interior_2m.ply">🏠 Warm Traditional Kitchen</button>
+                </div>
+            </div>
         </div>
         <div class="navbar-center" id="navbar-status">Ready</div>
         <div class="navbar-right">
@@ -402,11 +458,55 @@
             document.addEventListener('contextmenu', event => event.preventDefault());
         }
 
-        async function runWithData(pcData, sceneData, pcName, sceneName) {
+        // ── Demo sample loader ───────────────────────────────────────────────
+        // Place sample .ply files in public/demos/ to make them available.
+        const DEMO_BASE_URL = "demos/";
+
+        async function loadDemoFile(filename) {
+            const statusEl = document.getElementById("navbar-status");
+            statusEl.textContent = "Downloading " + filename + "…";
+            document.getElementById("spinner").style.display = "flex";
+            document.getElementById("no-file").style.display = "none";
             document.getElementById("loading-error").style.display = "none";
 
+            try {
+                const url = DEMO_BASE_URL + encodeURIComponent(filename);
+                const response = await fetch(url);
+                if (!response.ok) throw new Error("Download failed: " + response.statusText);
+                const data = new Uint8Array(await response.arrayBuffer());
+                statusEl.textContent = "Rendering " + filename;
+                await runWithData(data, null, filename, null);
+                statusEl.textContent = filename;
+            } catch (e) {
+                showError(e, filename);
+                statusEl.textContent = "Error";
+            }
+        }
+
+        // Toggle dropdown & handle clicks
+        {
+            const btn = document.getElementById("try-demo-btn");
+            const dd = document.getElementById("demo-dropdown");
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                dd.classList.toggle("open");
+            });
+            document.addEventListener("click", () => dd.classList.remove("open"));
+            dd.addEventListener("click", (e) => {
+                const target = e.target.closest("[data-demo]");
+                if (!target) return;
+                dd.classList.remove("open");
+                loadDemoFile(target.dataset.demo);
+            });
+        }
+        // ── End demo loader ──────────────────────────────────────────────────
+
+        async function runWithData(pcData, sceneData, pcName, sceneName) {
+            document.getElementById("loading-error").style.display = "none";
+            document.getElementById("no-file").style.display = "none";
+
             if (renderActive) {
-                // A render is already running â€” hot-reload the new file inside the
+                // A render is already running — hot-reload the new file inside the
                 // existing WASM event loop instead of starting a new one.
                 reload_pc_wasm(pcData, sceneData || null);
                 return;

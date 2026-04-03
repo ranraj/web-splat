@@ -1,0 +1,115 @@
+
+The floor tilt angle from horizontal is simply:
+
+$$\theta = \arccos(\vec{up} \cdot \hat{Y}) \times \frac{180}{\pi}$$
+
+Where $\hat{Y} = (0, 1, 0)$ is world-up. Since `up.dot(Y) == up.y`, the formula reduces to `acos(up.y)` in degrees.
+
+**How to expose this**: I can add a `#[wasm_bindgen]` method to `WindowContext` that returns the floor angle in degrees, callable from the browser console. Would that be useful, or would you prefer to use it to **automatically derive `init_pitch`** from the actual PLY data instead of the hardcoded `0.096`?
+
+
+Let me read the key parts of lib.rs — imports and all 3 framing sites — before making changes. 
+
+Read [](file:///c%3A/Users/Ranjithraj/Documents/Projects/realities-project/VirtualBhoomi-app/engines/web-splat/src/lib.rs#1-1), lines 1 to 35
+
+Now let me read the exact current state of each framing site:   
+
+Read [](file:///c%3A/Users/Ranjithraj/Documents/Projects/realities-project/VirtualBhoomi-app/engines/web-splat/src/lib.rs#245-245), lines 245 to 280
+
+Read [](file:///c%3A/Users/Ranjithraj/Documents/Projects/realities-project/VirtualBhoomi-app/engines/web-splat/src/lib.rs#378-378), lines 378 to 415
+
+Read [](file:///c%3A/Users/Ranjithraj/Documents/Projects/realities-project/VirtualBhoomi-app/engines/web-splat/src/lib.rs#912-912), lines 912 to 940
+
+Now I understand the root cause clearly:
+
+- `elegant_library` and `warm_traditional`: PCA floor normal is close to `(0,1,0)` → identity rotation works fine
+- `rustic_kitchen`: PCA floor normal tilts far from Y ( walls dominate the point distribution) → old `acos` hack only moved the *position* but kept the *view direction* as identity `+Z`, making the scene appear 90° tilted
+
+**The fix**: Build a proper rotation matrix from `world_up` so both camera position AND view direction align with the floor — works for any PLY orientation. 
+
+Created 3 todos
+
+Replacing 1 lines with 1 lines in [](file:///c%3A/Users/Ranjithraj/Documents/Projects/realities-project/VirtualBhoomi-app/engines/web-splat/src/lib.rs)
+
+
+```
+
+```
+
+
+Starting: *Fix framing logic at all 3 sites* (2/3)
+
+Now replace all 3 framing sites in one call: 
+
+Replacing 48 lines with 65 lines in [](file:///c%3A/Users/Ranjithraj/Documents/Projects/realities-project/VirtualBhoomi-app/engines/web-splat/src/lib.rs)
+
+
+```
+
+```
+
+
+Checked [](file:///c%3A/Users/Ranjithraj/Documents/Projects/realities-project/VirtualBhoomi-app/engines/web-splat/src/lib.rs), no problems found
+
+Completed: *Fix framing logic at all 3 sites* (2/3)
+
+No errors. Here's exactly what changed and why:
+
+**Root cause**: The old `init_pitch = acos(world_up.y)` only rotated the camera's *position offset* — the actual *view direction* stayed locked at `Quaternion::one()` (+Z). For `rustic_kitchen`, where PCA detects the scene is tilted ~90°, the camera ended up positioned far from where it should be but still staring through the floor.
+
+**The fix — proper rotation matrix at all 3 sites**:
+
+1. **Quality gate**: `pc.up().filter(|up| up.y >= 0.5)` — only trust the PCA result when the detected floor normal is within 60° of world-Y. Beyond that, PCA found a wall dominant surface (rustic_kitchen), so fall back to `(0,1,0)`.
+
+2. **Horizontal look direction**: Project `+Z` onto the floor plane perpendicular to `world_up`. If `world_up ≈ ±Z`, fall back to `+X`. This gives a reliable viewing direction regardless of PLY axis conventions.
+
+3. **Rotation matrix**: Build `[right | world_up | look_horiz]` as column vectors → convert to `Quaternion`. This correctly sets both camera **position** and **view direction** to be perpendicular to the floor.
+
+**For your three files**:
+- `elegant_library`, `warm_traditional`: `world_up ≈ (0,1,0)` → rotation = identity → same behavior as before ✓
+- `rustic_kitchen`: PCA wall normal has `y < 0.5` → falls back to `(0,1,0)` → camera looks straight in with floor horizontal ✓
+
+Made changes.
+
+
+check
+------
+The old code used (0, -1, 0) as default up (Y-down convention from 3DGS/OpenCV)
+
+My new code changed to (0, 1, 0) as fallback and treated world_up as Y-up
+
+The Marble PLY files use Y-down convention where negative Y is up, and the plane_from_points function flips the normal to point toward +Y, but then the library file's up vector like (0, -0.99, 0.01) gets negated to (0, 0.99, -0.01) and passes the y >= 0.5 filter
+
+Let me analyze the three screenshots:
+
+rustic_kitchen (image 1): Default render shows just a dark/gray blur - camera is inside a wall or floor, wrong position
+rustic_kitchen (image 2): After manual rotation, scene is visible but heavily tilted - floor is not horizontal
+elegant_library (image 3): Camera is now looking at the ceiling/roof - the new code broke it by making it parallel to floor looking up
+The problem is clear:
+
+The old code used (0, -1, 0) as default up (Y-down convention from 3DGS/OpenCV)
+
+My new code changed to (0, 1, 0) as fallback and treated world_up as Y-up
+
+The Marble PLY files use Y-down convention where negative Y is up, and the plane_from_points function flips the normal to point toward +Y, but then the library file's up vector like (0, -0.99, 0.01) gets negated to (0, 0.99, -0.01) and passes the y >= 0.5 filter
+
+I need to trace through the plane detection logic more carefully to see where the coordinate system is getting confused. I'm realizing the issue: PCA finds the floor normal, but it's forcing normal.y >= 0, which gives (0, 1, 0) for a Y-down scene when it should be (0, -1, 0) to point toward negative Y where "up" actually is. downward, which is wrong. Let me trace through the working code from the conversation history more carefully. When PCA found a normal like (0.01, 0.99, 0.05) in elegant_library, the camera offset combined the backward movement in -Z with an upward shift in +Y, which positioned the camera correctly above and behind the scene center. The quaternion setup then...
+
+Actually, I think I see the issue now. The new rotation matrix construction is fundamentally different—it's treating the world_up vector as the middle column instead of using it to define the camera's vertical axis, which is flipping how the camera interprets its orientation relative to the scene. The real issue is that my rotation matrix is treating world_up as a camera axis when it's actually the floor normal, which doesn't match what the camera expects. Different PLY files have inconsistent axis conventions — some Y-up, some Y-down, some arbitrarily rotated — so I need a universal approach that detects and adapts to each file's orientation rather than forcing a single transformation.
+
+Instead of relying on PCA alone, I should combine multiple signals: use PCA to find the floor plane normal, check the bounding box to identify which axis represents room height, and analyze eigenvalues to pinpoint the floor-to-ceiling direction. The problem with my current plane_from_points function is that it works well when horizontal surfaces dominate the point cloud, but fails when walls capture more surface area and PCA finds a wall normal instead. The crude y >= 0.5 filtering won't scale across different file formats.
+
+Study camera rotation convention
+Study PCA up and AABB deminesions 
+Robust auto-oriented algorithm
+Implement at all 3 framing sites
+
+The world2view / rotation convention: camera.rotation is treated by world2view() as Matrix3::from(rotation), which maps world coords → camera coords. Quaternion::one() (identity) means the camera's local axes are the world axes: camera-right = +X, camera-down = +Y, camera-forward = +Z. This is the 3DGS/OpenCV convention.
+
+Matrix3::from_cols(right, world_up, look_horiz) approach: This built a world→camera matrix that transformed world_up to camera +Y (which is screen-DOWN in this convention). That made the camera look at the ceiling for the library and kitchen files that already had up ≈ (0,1,0).
+
+Use AABB dimensions to detect the "thin" axis (smallest extent) — that's "up" for the room. This is more robust than PCA for room-scale scenes.
+
+Camera looks from centroid + offset toward centroid, with the thin-axis as the up reference.
+
+et me check what Quaternion::look_at does in cgmath and how the controller uses it:
