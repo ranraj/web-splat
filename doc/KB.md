@@ -113,3 +113,15 @@ Use AABB dimensions to detect the "thin" axis (smallest extent) — that's "up" 
 Camera looks from centroid + offset toward centroid, with the thin-axis as the up reference.
 
 et me check what Quaternion::look_at does in cgmath and how the controller uses it:
+
+The old algorithm: AABB shortest-axis first, PCA only if it agrees with AABB. This fails when the AABB shortest axis is X or Z (narrow galley kitchen, corridor, gallery room) — it returned +X or +Z as "up", rotating the camera 90°. PCA (which correctly found +Y) was discarded because it didn't agree with the wrong AABB result.
+
+Image 1 (kitchen 90° tilt): The kitchen was narrower in X than it was tall in Y, so shortest_axis = X → aabb_up = +X. PCA produced ~+Y but PCA·(+X) = 0 < 0.707, so the code chose AABB (+X) over PCA — camera up was sideways.
+
+Image 2 (library, dark vignettes): Same root cause. Wrong world_up made the camera placement offset go sideways instead of upward, pushing the camera into or near a wall. Close-proximity wall Gaussians projected as huge blobs covering the frame edges.
+
+The fix — new priority order:
+
+PCA when |Y| ≥ 0.5 — the PCA floor-plane normal already flips to +Y in io/mod.rs. Trust it whenever it's mostly upright.
+AABB — only when Y is explicitly the shortest axis (ratio < 0.70). Never return X or Z as up.
++Y fallback — the standard 3DGS/COLMAP world convention.

@@ -450,6 +450,7 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
     // egui closure below only captures `ctrl` (not `state` itself).
     let playing = state.animation.as_ref().map(|(_, p)| *p).unwrap_or(false);
     let mut cinematic_toggle: Option<bool> = None;
+    let mut return_to_origin = false;
 
     let ctrl: &mut CameraController = &mut state.controller;
     let btn_stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
@@ -700,6 +701,12 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
                                 let r = wbtn(ui, "-", false);
                                 if r.is_pointer_button_down_on() { ctrl.process_scroll(-3.0); }
 
+                                // Return to Origin button (resets camera to initial frame)
+                                let r_origin = wbtn(ui, "↻", false);
+                                if r_origin.clicked() {
+                                    return_to_origin = true;
+                                }
+
                                 // Play / Pause cinematic animation
                                 let label = if playing { "Pause" } else { "Play" };
                                 let r = wbtn(ui, label, playing);
@@ -725,6 +732,11 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
         } else {
             state.stop_animation();
         }
+    }
+
+    // Apply return to origin by calling auto_frame_scene.
+    if return_to_origin {
+        crate::auto_frame_scene();
     }
 }
 

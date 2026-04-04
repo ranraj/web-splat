@@ -762,101 +762,68 @@ impl WindowContext {
 
 /// Determine a robust "up" direction for the scene.
 ///
-/// **Algorithm** (3-tier):
+/// **Algorithm** (priority order):
 ///
-/// 1. **AABB shortest axis** — For room-scale captures, rooms are always wider and
-///    deeper than they are tall, so the smallest bounding-box extent reveals the
-///    vertical axis reliably regardless of how many splats sit on walls vs floor.
+/// 1. **PCA normal** — `plane_from_points` (in `io/mod.rs`) computes the minimum-
+///    spread axis of the splat distribution and flips it toward +Y.  We trust it
+///    when its Y component is large enough (|Y| ≥ 0.5, i.e. within 60° of +Y),
+///    which covers every typical floor/ceiling-dominant capture.
 ///
-/// 2. **PCA consensus** — If `PointCloud::up()` returns a result *and* it agrees
-///    with the AABB axis (≤ 45°), prefer the PCA normal because it has sub-degree
-///    accuracy.  If PCA disagrees (wall-dominant distribution) it is silently
-///    discarded.
+/// 2. **AABB Y-axis check** — When PCA is unavailable or too horizontal, we fall
+///    back to the AABB *only* if Y is clearly the shortest extent (ratio < 0.70).
+///    We **never** return X or Z as the up axis: those are always floor-parallel
+///    (walls / depth) and returning them as "up" causes a 90° camera tilt.
 ///
-/// 3. **Fallback** — When neither PCA nor a clear shortest axis exist (e.g. a
-///    roughly cubic bounding box), fall back to world −Y (the standard 3DGS /
-///    OpenCV convention where −Y is ceiling-ward).
-///
-/// The sign of the returned vector is chosen so that the +Y component is ≥ 0
-/// when the axis is near Y; otherwise it points toward the positive half of
-/// whatever axis dominates.  This heuristic works because most PLY captures
-/// have the ceiling in the +Y / −Y half-space and the PCA code in `io/mod.rs`
-/// already flips the normal toward +Y.
+/// 3. **+Y fallback** — The standard 3DGS / COLMAP world convention is Y-up.
+///    When neither PCA nor a clear AABB Y axis is available, +Y is the safest
+///    default and correct for the vast majority of PLY captures.
 fn robust_scene_up(pc: &PointCloud) -> Vector3<f32> {
     use cgmath::InnerSpace;
 
-    let size = pc.bbox().size();
-    let ax = size.x.abs();
-    let ay = size.y.abs();
-    let az = size.z.abs();
-
-    // Sort extents to find shortest and second-shortest.
-    let mut extents = [(ax, 0u8), (ay, 1u8), (az, 2u8)];
-    extents.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-    let shortest_val  = extents[0].0;
-    let shortest_axis = extents[0].1;   // 0=X, 1=Y, 2=Z
-    let second_val    = extents[1].0;
-
-    let aabb_up = match shortest_axis {
-        0 => Vector3::unit_x(),
-        1 => Vector3::unit_y(),
-        _ => Vector3::unit_z(),
-    };
-
-    // AABB is trustworthy when the shortest extent is clearly smaller than the
-    // next one (ratio < 0.85).  For roughly cubic boxes, it's ambiguous.
-    let ratio = if second_val > 1e-6 { shortest_val / second_val } else { 1.0 };
-    let aabb_ok = ratio < 0.85 && shortest_val > 1e-6;
-
-    // PCA result from plane_from_points (computed at load time).
     let pca_up = pc.up();
 
-    let chosen = if let Some(pca) = pca_up {
-        if aabb_ok {
-            // Both available — use PCA only if it agrees with AABB axis (≤ 45°)
-            if pca.dot(aabb_up).abs() > 0.707 {
-                pca // PCA agrees — use its sub-degree accuracy
-            } else {
-                aabb_up // PCA found a wall — trust AABB
-            }
-        } else {
-            // AABB is ambiguous.  Trust the PCA unconditionally; it's the best
-            // information we have for a roughly cubic scene.
-            pca
+    // ── Priority 1: PCA normal ──────────────────────────────────────────────
+    // Trust PCA when it points mostly toward Y (within 60° → |Y| ≥ 0.5).
+    // plane_from_points already flips the normal so Y ≥ 0; the belt-and-
+    // suspenders sign check here handles any edge case.
+    if let Some(pca) = pca_up {
+        let n = pca.normalize();
+        if n.y.abs() >= 0.5 {
+            let up = if n.y >= 0.0 { n } else { -n };
+            log::info!(
+                "robust_scene_up: PCA ({:.4},{:.4},{:.4}) — using it",
+                up.x, up.y, up.z
+            );
+            return up;
         }
-    } else if aabb_ok {
-        aabb_up
-    } else {
-        // Neither source is usable — the standard Y-down convention means
-        // "screen up" maps to −Y in world.  But most marble PLY files have
-        // the PCA normal near +Y, so +Y is the safest fallback.
-        Vector3::unit_y()
-    };
+        log::info!(
+            "robust_scene_up: PCA ({:.4},{:.4},{:.4}) too horizontal (|Y|<0.5), skipping",
+            n.x, n.y, n.z
+        );
+    }
 
-    // Ensure the up vector points into the positive half of its dominant axis.
-    // The PCA code in io/mod.rs already flips toward +Y, so this is a safety net.
-    let dominant = if chosen.x.abs() > chosen.y.abs() && chosen.x.abs() > chosen.z.abs() {
-        chosen.x
-    } else if chosen.y.abs() > chosen.z.abs() {
-        chosen.y
-    } else {
-        chosen.z
-    };
-    let up = if dominant < 0.0 { -chosen } else { chosen };
-    let up = up.normalize();
+    // ── Priority 2: AABB, only when Y is unambiguously shortest ────────────
+    // Returning X or Z as "up" rotates the camera 90°, so we never do that.
+    {
+        let s = pc.bbox().size();
+        let ay = s.y.abs();
+        let ax = s.x.abs();
+        let az = s.z.abs();
+        if ay < ax && ay < az {
+            let ratio = ay / ax.min(az).max(1e-6);
+            if ratio < 0.70 {
+                log::info!(
+                    "robust_scene_up: AABB Y is shortest (ratio {:.3}), using +Y",
+                    ratio
+                );
+                return Vector3::unit_y();
+            }
+        }
+    }
 
-    log::info!(
-        "robust_scene_up: bbox_size=({:.3},{:.3},{:.3}) shortest_axis={} ratio={:.3} aabb_ok={} pca={:?} chosen=({:.4},{:.4},{:.4})",
-        ax, ay, az,
-        ['X','Y','Z'][shortest_axis as usize],
-        ratio,
-        aabb_ok,
-        pca_up.map(|v| (v.x, v.y, v.z)),
-        up.x, up.y, up.z,
-    );
-
-    up
+    // ── Priority 3: +Y default ──────────────────────────────────────────────
+    log::info!("robust_scene_up: fallback to +Y (3DGS convention)");
+    Vector3::unit_y()
 }
 
 /// Project `base_dir` onto the floor plane (perpendicular to `up`) and normalise.
@@ -1003,14 +970,24 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 match state.reload_from_bytes(pc_bytes, scene_bytes) {
                     Ok(()) => {
                         log::info!("point cloud hot-reloaded successfully");
+                        // Hide the "Unpacking" spinner now that reload is complete
+                        let _ = web_sys::window()
+                            .and_then(|win| win.document())
+                            .and_then(|doc| {
+                                doc.get_element_by_id("spinner").map(|elem| {
+                                    let _ = elem.set_attribute("style", "display:none;");
+                                })
+                            });
                         state.window.request_redraw();
                     }
                     Err(e) => log::error!("hot-reload failed: {:?}", e),
                 }
             }
 
-            // Check if JS called auto_center_camera() to explicitly reset the view.
+            // Check if JS or gamepad called auto_center_camera() / return_to_origin() to reset the view.
             let needs_center = PENDING_AUTO_CENTER.with(|cell| {
+                std::mem::replace(&mut *cell.borrow_mut(), false)
+            }) || PENDING_RETURN_TO_ORIGIN.with(|cell| {
                 std::mem::replace(&mut *cell.borrow_mut(), false)
             });
             if needs_center {
@@ -1223,6 +1200,13 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+/// Signal from gamepad or JS to return camera to origin (initial auto-framed position).
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_RETURN_TO_ORIGIN: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+}
+
 /// Caches [cx, cy, cz, radius] for the currently loaded point cloud so that
 /// `get_scene_bounds()` can return them synchronously from JS.
 #[cfg(target_arch = "wasm32")]
@@ -1263,6 +1247,16 @@ pub fn auto_center_camera() {
 #[wasm_bindgen]
 pub fn auto_frame_scene() {
     PENDING_AUTO_CENTER.with(|cell| {
+        *cell.borrow_mut() = true;
+    });
+}
+
+/// Return the camera to the origin (same as auto_frame_scene).
+/// Callable from JavaScript and internally from the gamepad "Return to Origin" button.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn return_to_origin() {
+    PENDING_RETURN_TO_ORIGIN.with(|cell| {
         *cell.borrow_mut() = true;
     });
 }
