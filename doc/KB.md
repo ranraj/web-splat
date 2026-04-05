@@ -125,3 +125,62 @@ The fix — new priority order:
 PCA when |Y| ≥ 0.5 — the PCA floor-plane normal already flips to +Y in io/mod.rs. Trust it whenever it's mostly upright.
 AABB — only when Y is explicitly the shortest axis (ratio < 0.70). Never return X or Z as up.
 +Y fallback — the standard 3DGS/COLMAP world convention.
+
+A zero-dependency library with three modules:
+
+Module	Purpose
+math.rs	Minimal Vec3 type with dot/cross/normalize — no cgmath/glam needed
+analysis.rs	SceneAnalysis::from_points() — median centroid, p90 radius, outlier removal, 3-tier up-axis detection (PCA → AABB → +Y fallback, matching web-splat's robust_scene_up)
+camera.rs	AutoCamera::frame() — intelligent camera placement with CameraHint::{Interior, Exterior, Auto}
+Key intelligence in the camera:
+
+Interior mode (rooms): places camera inside the cloud, 12% pullback + 6.3% eye-rise, 60° horizontal FOV — matches web-splat's auto_frame_scene
+Exterior mode (objects): 45° orbit, 20° elevation, 1.8× radius, 50° FOV
+Auto mode: heuristic based on floor-area-to-height ratio
+.project() method built in for direct world→screen mapping
+
+PCB/AABB
+sRGB gamma correction
+
+Camera tilt fix (camera.rs):
+
+right = world_up × forward (was forward × world_up — reversed, causing the 90° roll)
+up = forward × right (was right × forward — also reversed)
+Interior camera now approaches from a ¾ diagonal ([0.7, 0.0, 1.0]) instead of straight-on, for a more cinematic angle
+Brightness fix (thumbnail.rs):
+
+Added proper sRGB gamma correction (linear_to_srgb) — the old code wrote linear RGB directly, which looks dark/washed-out on screen
+Alpha blending instead of hard pixel overwrite — overlapping splats accumulate naturally
+Depth-adaptive splat size — near points render larger (up to 6px), far points render smaller (1px), based on projecting a fixed world-space size through the perspective divide
+Distance-based opacity fade — far splats are slightly more transparent, giving natural depth cues
+
+OCR (Optical Character Recognition) and spatial grounding
+
+
+Now I'll make the changes. The key differences between vb_auto_camera (thumbnail) and web-splat:
+
+Parameter	auto_camera (thumbnail)	web-splat (current)
+Interior FOV	65°	60°
+Exterior mode	50° FOV, ¾ elevated orbit	none (always interior)
+Near plane	max(radius×0.001, 0.001)	0.005
+Far plane	radius×20	1000
+Look direction fallbacks	+Z, -Z, +Y, +X	+Z, +X
+
+Interior/exterior auto-detection — added guess_interior() (same heuristic as auto_camera: "wide and flat" = interior)
+Interior camera: FOV 60° → 65°, same position formula (radius×0.12 pullback, radius×0.063 eye rise)
+Exterior camera (new): ¾ elevated orbit at radius×1.8 distance, 20° elevation, 50° FOV — matches auto_camera's exterior framing
+Adaptive clip planes: near = max(radius×0.001, 0.001), far = radius×20 (was hardcoded 0.005/1000)
+Better look-direction fallbacks: tries +Z, −Z, +Y, +X (was only +Z → +X)
+All three camera setup sites were updated: WindowContext::new(), reload_from_bytes(), and the auto_frame_scene/return_to_origin handler.
+
+Vantage point
+Cardinal
+quaternion
+VIEW port
+3DGS rendering
+
+
+DX12/WGL
+crate (DX12/WGL backend incompatibility on this Windows toolchain
+
+pnpm --filter @vb/web

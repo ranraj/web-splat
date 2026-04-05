@@ -185,6 +185,25 @@ impl GenericGaussianPointCloud {
     pub fn compressed(&self) -> bool {
         self.compressed
     }
+
+    /// Extract flat position `[x,y,z, x,y,z, …]` and opacity arrays for
+    /// `vb_auto_camera::SceneAnalysis::from_points`.  Handles both compressed
+    /// and uncompressed Gaussian storage formats.
+    pub fn positions_and_opacities(&self) -> (Vec<[f32; 3]>, Vec<f32>) {
+        if self.compressed {
+            let gs: &[GaussianCompressed] = bytemuck::cast_slice(&self.gaussians);
+            let pos = gs.iter().map(|g| [g.xyz.x, g.xyz.y, g.xyz.z]).collect();
+            // i8 opacity: normalise to [0, 1]; clamp negatives to 0.
+            let opa = gs.iter().map(|g| (g.opacity as f32).max(0.0) / 127.0).collect();
+            (pos, opa)
+        } else {
+            let gs: &[Gaussian] = bytemuck::cast_slice(&self.gaussians);
+            let pos = gs.iter().map(|g| [g.xyz.x, g.xyz.y, g.xyz.z]).collect();
+            // f16 opacity is already in [0, 1] after sigmoid; clamp to be safe.
+            let opa = gs.iter().map(|g| f32::from(g.opacity).max(0.0)).collect();
+            (pos, opa)
+        }
+    }
 }
 
 // Fit a plane to a collection of points.

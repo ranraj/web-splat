@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_arch = "wasm32")]
 use web_time::{Duration, Instant};
 
-use cgmath::{Deg, EuclideanSpace, Point3, Quaternion, Rotation, UlpsEq, Vector2, Vector3};
+use cgmath::{EuclideanSpace, Point3, Quaternion, Rotation, UlpsEq, Vector2, Vector3};
 use egui::FullOutput;
+use vb_auto_camera::{AutoCamera, CameraHint, SceneAnalysis};
 
 #[cfg(not(target_arch = "wasm32"))]
 use utils::RingBuffer;
@@ -203,6 +204,11 @@ impl WindowContext {
         surface.configure(&device, &config);
 
         let pc_raw = io::GenericGaussianPointCloud::load(pc_file)?;
+        // ── Auto-frame via vb_auto_camera (same algorithm as thumbnail.rs) ──────────────
+        // Uses opacity-weighted scene analysis — more robust than the old centroid+radius
+        // heuristic — so the initial view matches the thumbnail exactly.
+        let (view_camera, centroid, world_up) =
+            auto_frame_from_raw(&pc_raw, size.width, size.height);
         let pc = PointCloud::new(&device, pc_raw)?;
         log::info!("loaded point cloud with {:} points", pc.num_points());
 
@@ -210,72 +216,8 @@ impl WindowContext {
             GaussianRenderer::new(&device, &queue, render_format, pc.sh_deg(), pc.compressed())
                 .await;
 
-        let aspect = size.width as f32 / size.height as f32;
-
-        // Auto-frame: derive centroid and bounding-sphere radius (both measured from the
-        // statistical centroid — fixes the old behaviour where radius was from the AABB
-        // centre, which could differ by 30-50 % for asymmetric scenes).
-        let (centroid, radius) = pc.centroid_and_radius();
-
-        // ── Interior scene auto-framing ─────────────────────────────────────────────────
-        //
-        // For room-scale / interior 3DGS scenes the camera MUST be placed INSIDE the
-        // point cloud.  Placing it outside (large radius × multiplier) produces the
-        // "dark vignette / tunnel-of-splats" artefact visible in Image 1:
-        //
-        //   • Wall / ceiling Gaussians are seen from an exterior angle.
-        //   • They project as very large, blurry ellipses that cover the screen edges.
-        //   • The only clear area is the hole where we look through the dense cloud.
-        //
-        // Solution — keep the camera near the centroid (inside the room):
-        //
-        //   pullback  = radius × 0.20  →  20 % of bounding radius in –Z direction.
-        //               This is small enough to stay inside any room-scale scene while
-        //               still giving the orbit controller a non-zero target→camera vector.
-        //               The camera looks in +Z (identity quaternion), revealing the room
-        //               interior directly in front.
-        //
-        //   eye_rise  = radius × 0.15  in  world_up direction  (toward the ceiling in
-        //               the standard 3DGS / OpenCV Y-down convention where world_up ≈
-        //               (0,−1,0)).  This shifts the initial view from mid-room height to
-        //               approximately eye level.
-        //
-        //   FOV       = 60 °  (horizontal).  Wider than the 45° default; gives the
-        //               natural "standing inside a room" perspective that matches the
-        //               Marble WorldLabs reference viewer.
-        //
-        //   near plane = 0.005  (half the old 0.01) so close-by splats are not clipped.
-        // ── Robust scene-up detection ──────────────────────────────────────
-        // Strategy: use the AABB shortest axis as the "up" direction (rooms are
-        // always wider & deeper than tall).  If PCA also found a floor plane
-        // that agrees (within 45°), prefer the PCA result for sub-degree
-        // accuracy.  Otherwise fall back to the AABB axis.
-        let world_up = robust_scene_up(&pc);
-        let back_dist = radius * 0.12;
-        let eye_rise  = radius * 0.063;
-        // Look direction: project +Z onto the floor (perpendicular to up).
-        let look_dir = floor_projected_direction(Vector3::unit_z(), world_up);
-        let camera_offset = -look_dir * back_dist + world_up * eye_rise;
-        // Quaternion::look_at(forward, up): +Z → forward, +Y → up.
-        // This matches the orbit controller's convention exactly.
-        let camera_rotation = Quaternion::look_at(look_dir, world_up);
-        let view_camera = PerspectiveCamera::new(
-            centroid + camera_offset,
-            camera_rotation,
-            PerspectiveProjection::new(
-                Vector2::new(size.width, size.height),
-                // 60 ° horizontal FOV for a natural room-scale perspective.
-                Vector2::new(Deg(60.0f32), Deg(60.0f32 / aspect)),
-                0.005, // very small near plane: close splats (furniture, walls) stay visible
-                1000.,
-            ),
-        );
-
         let mut controller = CameraController::new(0.1, 0.05);
-        // Orbit center = statistical centroid so every drag pivots around the scene.
         controller.center = centroid;
-        // Set the stable orbit axis from the robust scene-up so the horizon
-        // stays level during 360° rotation.
         controller.up = Some(world_up);
 
         // Cache scene bounds so JS can read them via get_scene_bounds() at any time.
@@ -369,28 +311,10 @@ impl WindowContext {
     ) -> anyhow::Result<()> {
         use std::io::Cursor;
         let pc_raw = io::GenericGaussianPointCloud::load(Cursor::new(pc_bytes))?;
+        let (new_camera, centroid, world_up) =
+            auto_frame_from_raw(&pc_raw, self.config.width, self.config.height);
         self.pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
-
-        // Auto-frame using the same interior-placement formula as WindowContext::new().
-        // See the detailed comment there for the derivation.
-        let (centroid, radius) = self.pc.centroid_and_radius();
-        let world_up = robust_scene_up(&self.pc);
-        let back_dist = radius * 0.12;
-        let eye_rise  = radius * 0.063;
-        let look_dir = floor_projected_direction(Vector3::unit_z(), world_up);
-        let camera_offset = -look_dir * back_dist + world_up * eye_rise;
-        let camera_rotation = Quaternion::look_at(look_dir, world_up);
-        let aspect = self.config.width as f32 / self.config.height as f32;
-        self.splatting_args.camera = PerspectiveCamera::new(
-            centroid + camera_offset,
-            camera_rotation,
-            PerspectiveProjection::new(
-                Vector2::new(self.config.width, self.config.height),
-                Vector2::new(Deg(60.0f32), Deg(60.0f32 / aspect)),
-                0.005,
-                1000.,
-            ),
-        );
+        self.splatting_args.camera = new_camera;
         // Mirror exactly what WindowContext::new does — just set center, no reset_to_camera.
         // Calling reset_to_camera with identity rotation corrupts the controller center
         // (projects it along +Z instead of toward the PC center) causing wrong camera orientation.
@@ -841,6 +765,77 @@ fn floor_projected_direction(base_dir: Vector3<f32>, up: Vector3<f32>) -> Vector
 
 pub fn smoothstep(x: f32) -> f32 {
     return x * x * (3.0 - 2.0 * x);
+}
+
+/// Snap an arbitrary unit vector to the nearest cardinal axis (±X, ±Y, ±Z).
+/// Used to keep the horizon level when PCA returns a slightly-tilted floor normal.
+fn snap_to_cardinal_cgmath(v: Vector3<f32>) -> Vector3<f32> {
+    let abs_x = v.x.abs();
+    let abs_y = v.y.abs();
+    let abs_z = v.z.abs();
+    let sign_x = if v.x >= 0.0 { 1.0_f32 } else { -1.0_f32 };
+    let sign_y = if v.y >= 0.0 { 1.0_f32 } else { -1.0_f32 };
+    let sign_z = if v.z >= 0.0 { 1.0_f32 } else { -1.0_f32 };
+    if abs_x >= abs_y && abs_x >= abs_z {
+        Vector3::new(sign_x, 0.0, 0.0)
+    } else if abs_y >= abs_x && abs_y >= abs_z {
+        Vector3::new(0.0, sign_y, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, sign_z)
+    }
+}
+
+/// Build a `PerspectiveCamera` using `vb_auto_camera` — the same algorithm used
+/// by `thumbnail.rs` — so the web viewer's initial framing matches the thumbnail.
+fn auto_frame_from_raw(
+    pc_raw: &io::GenericGaussianPointCloud,
+    width: u32,
+    height: u32,
+) -> (PerspectiveCamera, Point3<f32>, Vector3<f32>) {
+    use cgmath::Rad;
+    let (positions, opacities) = pc_raw.positions_and_opacities();
+    let weights: Option<&[f32]> = if opacities.is_empty() { None } else { Some(&opacities) };
+    let analysis = SceneAnalysis::from_points(&positions, weights);
+    let auto_cam = AutoCamera::frame(&analysis, width, height, CameraHint::Auto);
+
+    let position = Point3::new(
+        auto_cam.position.x(),
+        auto_cam.position.y(),
+        auto_cam.position.z(),
+    );
+    let look_dir = Vector3::new(
+        auto_cam.forward.x(),
+        auto_cam.forward.y(),
+        auto_cam.forward.z(),
+    );
+    let raw_up = Vector3::new(
+        auto_cam.world_up.x(),
+        auto_cam.world_up.y(),
+        auto_cam.world_up.z(),
+    );
+    let world_up = snap_to_cardinal_cgmath(raw_up);
+    let rotation = Quaternion::look_at(look_dir, world_up);
+
+    let aspect = width as f32 / height.max(1) as f32;
+    let fov_y = Rad(auto_cam.fov_y_rad);
+    let fov_x = Rad(2.0_f32 * ((auto_cam.fov_y_rad * 0.5).tan() * aspect).atan());
+
+    let camera = PerspectiveCamera::new(
+        position,
+        rotation,
+        PerspectiveProjection::new(
+            Vector2::new(width, height),
+            Vector2::new(fov_x, fov_y),
+            auto_cam.near,
+            auto_cam.far,
+        ),
+    );
+    let centroid = Point3::new(
+        auto_cam.target.x(),
+        auto_cam.target.y(),
+        auto_cam.target.z(),
+    );
+    (camera, centroid, world_up)
 }
 
 pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
