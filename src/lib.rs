@@ -139,6 +139,9 @@ pub struct WindowContext {
     display: Display,
 
     splatting_args: SplattingArgs,
+    /// One-shot flag: when `true`, the next frame will re-render the scene even
+    /// if `splatting_args` hasn't changed (e.g. wall-tint uniform update).
+    force_scene_redraw: bool,
 
     saved_cameras: Vec<SceneCamera>,
     #[cfg(feature = "video")]
@@ -271,6 +274,7 @@ impl WindowContext {
             ui_visible: false,
             gamepad_visible: false,
             display,
+            force_scene_redraw: false,
             saved_cameras: Vec::new(),
             #[cfg(feature = "video")]
             cameras_save_path: "cameras_saved.json".to_string(),
@@ -1016,6 +1020,13 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 }
                 state.window.request_redraw();
             }
+
+            // Check if JS called set_wall_tint_wasm() or clear_wall_tint_wasm().
+            if let Some(tint) = PENDING_WALL_TINT.with(|cell| cell.borrow_mut().take()) {
+                state.renderer.set_wall_tint(&state.wgpu_context.queue, tint);
+                state.force_scene_redraw = true;
+                state.window.request_redraw();
+            }
         }
 
         match event {
@@ -1136,7 +1147,8 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
 
                 let resolution_change = state.splatting_args.viewport != Vector2::new(state.config.width, state.config.height);
 
-                let request_redraw = old_settings != state.splatting_args || resolution_change;
+                let request_redraw = old_settings != state.splatting_args || resolution_change || state.force_scene_redraw;
+                state.force_scene_redraw = false;
 
                 if request_redraw || redraw_ui{
                     state.fps = (1. / dt.as_secs_f32()) * 0.05 + state.fps * 0.95;
@@ -1281,6 +1293,38 @@ pub fn start_cinematic_pan_wasm() {
 pub fn stop_cinematic_pan_wasm() {
     PENDING_CINEMATIC.with(|cell| {
         *cell.borrow_mut() = Some(false);
+    });
+}
+
+/// Pending wall tint change from JS.
+/// `Some(Some([r, g, b, strength]))` → set tint; `Some(None)` → clear tint; `None` → no change.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_WALL_TINT: std::cell::RefCell<Option<Option<[f32; 4]>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Apply a real-time RGBA wall color tint to the currently rendering scene.
+///
+/// * `r`, `g`, `b` — tint color in the 0.0–1.0 range.
+/// * `strength`    — blend strength in the 0.0–1.0 range (0 = no effect, 1 = full replacement).
+///
+/// The tint is applied in the Gaussian splat fragment shader on the next rendered frame.
+/// Call `clear_wall_tint_wasm()` to restore original colors.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn set_wall_tint_wasm(r: f32, g: f32, b: f32, strength: f32) {
+    PENDING_WALL_TINT.with(|cell| {
+        *cell.borrow_mut() = Some(Some([r, g, b, strength]));
+    });
+}
+
+/// Remove the wall color tint and restore original splat colors.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn clear_wall_tint_wasm() {
+    PENDING_WALL_TINT.with(|cell| {
+        *cell.borrow_mut() = Some(None);
     });
 }
 

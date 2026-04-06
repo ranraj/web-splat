@@ -27,6 +27,7 @@ pub struct GaussianRenderer {
     color_format: wgpu::TextureFormat,
     sorter: GPURSSorter,
     sorter_suff: Option<PointCloudSortStuff>,
+    wall_tint: UniformBuffer<WallTintUniform>,
 }
 
 impl GaussianRenderer {
@@ -42,6 +43,7 @@ impl GaussianRenderer {
             bind_group_layouts: &[
                 Some(&PointCloud::bind_group_layout_render(device)), // Needed for points_2d (on binding 2)
                 Some(&GPURSSorter::bind_group_layout_rendering(device)), // Needed for indices   (on binding 4)
+                Some(&UniformBuffer::<WallTintUniform>::bind_group_layout(device)), // group(2): wall tint
             ],
             immediate_size: 0,
         });
@@ -133,6 +135,7 @@ impl GaussianRenderer {
                 device,
                 Some("render settings uniform buffer"),
             ),
+            wall_tint: UniformBuffer::new_default(device, Some("wall tint uniform")),
         }
     }
 
@@ -268,6 +271,7 @@ impl GaussianRenderer {
     ) {
         render_pass.set_bind_group(0, pc.render_bind_group(), &[]);
         render_pass.set_bind_group(1, &self.sorter_suff.as_ref().unwrap().sorter_render_bg, &[]);
+        render_pass.set_bind_group(2, self.wall_tint.bind_group(), &[]);
         render_pass.set_pipeline(&self.pipeline);
 
         render_pass.draw_indirect(&self.draw_indirect_buffer, 0);
@@ -298,6 +302,44 @@ impl GaussianRenderer {
 
     pub(crate) fn render_settings(&self) -> &UniformBuffer<SplattingArgsUniform> {
         &self.render_settings
+    }
+
+    /// Apply a real-time wall color tint.
+    ///
+    /// * `color` — `Some([r, g, b, strength])` enables the tint; `None` disables it.
+    ///   All components are in the 0.0–1.0 range.
+    pub fn set_wall_tint(&mut self, queue: &wgpu::Queue, color: Option<[f32; 4]>) {
+        let u = self.wall_tint.as_mut();
+        if let Some([r, g, b, strength]) = color {
+            u.rgb_strength = [r, g, b, strength];
+            u.enabled = 1;
+        } else {
+            u.enabled = 0;
+        }
+        self.wall_tint.sync(queue);
+    }
+}
+
+/// Wall tint uniform — matches the `WallTint` struct layout in `gaussian.wgsl`.
+///
+/// `rgb_strength`: xyz = tint color, w = blend strength.  Packed as vec4 to avoid
+/// the WGSL vec3 alignment mismatch (vec3<f32> pads to 16 bytes in a uniform struct).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WallTintUniform {
+    /// tint color (r, g, b) + blend strength (a) packed to match WGSL vec4
+    pub rgb_strength: [f32; 4],
+    pub enabled: u32,
+    pub _pad: [u32; 3],
+}
+
+impl Default for WallTintUniform {
+    fn default() -> Self {
+        Self {
+            rgb_strength: [1.0, 1.0, 1.0, 0.0],
+            enabled: 0,
+            _pad: [0; 3],
+        }
     }
 }
 

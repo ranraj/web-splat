@@ -27,6 +27,20 @@ var<storage, read> points_2d : array<Splat>;
 @group(1) @binding(4)
 var<storage, read> indices : array<u32>;
 
+// Wall tint — applied as a real-time color overlay in the fragment shader.
+// rgb_strength.xyz = tint color, rgb_strength.w = blend strength [0..1].
+// enabled = 0 means no tint is applied.
+struct WallTint {
+    rgb_strength: vec4<f32>,  // packed: xyz=color, w=strength
+    enabled: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(2) @binding(0)
+var<uniform> wall_tint: WallTint;
+
 @vertex
 fn vs_main(
     @builtin(vertex_index) in_vertex_index: u32,
@@ -63,5 +77,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
     let b = min(0.99, exp(-a) * in.color.a);
-    return vec4<f32>(in.color.rgb, 1.) * b;
+    var rgb = in.color.rgb;
+    // Apply real-time wall tint when enabled
+    if wall_tint.enabled != 0u {
+        rgb = mix(rgb, wall_tint.rgb_strength.xyz, wall_tint.rgb_strength.w);
+    }
+    return vec4<f32>(rgb, 1.) * b;
 }
