@@ -186,3 +186,5 @@ crate (DX12/WGL backend incompatibility on this Windows toolchain
 pnpm --filter @vb/web
 
 plylancemcpserver
+
+WSGL

@@ -63,7 +63,9 @@ struct Splat {
     // 2x f16 packed as u32
     pos: u32,
     // rgba packed as u8
-    color_0: u32,color_1: u32,
+    color_0: u32, color_1: u32,
+    // wall-ness score [0,1] in lower f16, upper f16 unused
+    wall_factor: u32,
 };
 
 // struct DrawIndirect {
@@ -312,12 +314,36 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
     let v = vec4<f32>(v1 / viewport, v2 / viewport);
+
+    // --- Selective wall tinting: compute wall-ness score [0, 1] from 3D covariance ---
+    // Use raw (pre-s2) covariance so wall detection is scale-independent.
+    let shape_c1 = unpack2x16float(geometric_info.cov[0]);
+    let shape_c2 = unpack2x16float(geometric_info.cov[1]);
+    let shape_c3 = unpack2x16float(geometric_info.cov[2]);
+    let Vrk_shape = mat3x3<f32>(
+        shape_c1.x, shape_c1.y, shape_c2.x,
+        shape_c1.y, shape_c2.y, shape_c3.x,
+        shape_c2.x, shape_c3.x, shape_c3.y
+    );
+    let tr_shape = max(1e-6, Vrk_shape[0][0] + Vrk_shape[1][1] + Vrk_shape[2][2]);
+    var pi_nrm = vec3<f32>(0.0, 1.0, 0.0);
+    var pi_mv: vec3<f32>;
+    pi_mv = tr_shape * pi_nrm - Vrk_shape * pi_nrm;
+    if length(pi_mv) > 1e-8 { pi_nrm = normalize(pi_mv); }
+    pi_mv = tr_shape * pi_nrm - Vrk_shape * pi_nrm;
+    if length(pi_mv) > 1e-8 { pi_nrm = normalize(pi_mv); }
+    pi_mv = tr_shape * pi_nrm - Vrk_shape * pi_nrm;
+    if length(pi_mv) > 1e-8 { pi_nrm = normalize(pi_mv); }
+    pi_mv = tr_shape * pi_nrm - Vrk_shape * pi_nrm;
+    if length(pi_mv) > 1e-8 { pi_nrm = normalize(pi_mv); }
+    let wall_factor_val = 1.0 - abs(pi_nrm.y);
+
     points_2d[store_idx] = Splat(
         pack2x16float(v.xy), pack2x16float(v.zw),
         pack2x16float(v_center.xy),
         pack2x16float(color.rg), pack2x16float(color.ba),
+        pack2x16float(vec2<f32>(wall_factor_val, 0.0)),
     );
-    
     sort_depths[store_idx] = bitcast<u32>(pos2d.z);
     sort_indices[store_idx] = store_idx;
 

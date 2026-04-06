@@ -390,6 +390,9 @@ pub struct Splat {
     pub v: Vector4<f16>,
     pub pos: Vector2<f16>,
     pub color: Vector4<f16>,
+    /// Wall-ness score packed as f16 in the lower half-word; upper half is padding.
+    pub wall_factor: f16,
+    pub _pad: f16,
 }
 
 #[repr(C)]

@@ -45,7 +45,9 @@ struct Splat {
     // 2x f16 packed as u32
     pos: u32,
     // rgba packed as f16
-    color_0: u32,color_1: u32
+    color_0: u32, color_1: u32,
+    // wall-ness score [0,1] in lower f16, upper f16 unused
+    wall_factor: u32,
 };
 
 struct DrawIndirect {
@@ -261,10 +263,36 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
     let v = vec4<f32>(v1 / viewport, v2 / viewport);
+
+    // --- Selective wall tinting: compute wall-ness score [0, 1] from 3D covariance ---
+    // Build the unscaled 3D covariance matrix (represents shape/orientation only).
+    let Vrk_shape = mat3x3<f32>(
+        cov_sparse[0], cov_sparse[1], cov_sparse[2],
+        cov_sparse[1], cov_sparse[3], cov_sparse[4],
+        cov_sparse[2], cov_sparse[4], cov_sparse[5]
+    );
+    // Power iteration on (trace*I - Vrk_shape):
+    // The maximum eigenvector of this shifted matrix = minimum eigenvector of Vrk_shape
+    // = the surface normal direction of this Gaussian.
+    let tr_shape = max(1e-6, Vrk_shape[0][0] + Vrk_shape[1][1] + Vrk_shape[2][2]);
+    var pi_nrm = vec3<f32>(0.0, 1.0, 0.0); // initial guess (up vector)
+    var pi_mv: vec3<f32>;
+    pi_mv = tr_shape * pi_nrm - Vrk_shape * pi_nrm;
+    if length(pi_mv) > 1e-8 { pi_nrm = normalize(pi_mv); }
+    pi_mv = tr_shape * pi_nrm - Vrk_shape * pi_nrm;
+    if length(pi_mv) > 1e-8 { pi_nrm = normalize(pi_mv); }
+    pi_mv = tr_shape * pi_nrm - Vrk_shape * pi_nrm;
+    if length(pi_mv) > 1e-8 { pi_nrm = normalize(pi_mv); }
+    pi_mv = tr_shape * pi_nrm - Vrk_shape * pi_nrm;
+    if length(pi_mv) > 1e-8 { pi_nrm = normalize(pi_mv); }
+    // wall_factor: 1.0 when normal is horizontal (wall), 0.0 when vertical (floor/ceiling)
+    let wall_factor_val = 1.0 - abs(pi_nrm.y);
+
     points_2d[store_idx] = Splat(
         pack2x16float(v.xy), pack2x16float(v.zw),
         pack2x16float(v_center.xy),
         pack2x16float(color.rg), pack2x16float(color.ba),
+        pack2x16float(vec2<f32>(wall_factor_val, 0.0)),
     );
     // filling the sorting buffers and the indirect sort dispatch buffer
     sort_depths[store_idx] = bitcast<u32>(pos2d.z);

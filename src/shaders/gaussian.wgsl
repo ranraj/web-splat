@@ -5,6 +5,9 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) screen_pos: vec2<f32>,
     @location(1) color: vec4<f32>,
+    /// Wallness score [0, 1] computed from 3D covariance in the preprocess shader.
+    /// 1.0 = horizontal normal (wall), 0.0 = vertical normal (floor/ceiling) or isotropic.
+    @location(2) wall_factor: f32,
 };
 
 struct VertexInput {
@@ -19,7 +22,9 @@ struct Splat {
     // 2x f16 packed as u32
     pos: u32,
     // rgba packed as f16
-    color_0: u32,color_1: u32,
+    color_0: u32, color_1: u32,
+    // wall-ness score [0,1] in lower f16, upper f16 unused
+    wall_factor: u32,
 };
 
 @group(0) @binding(2)
@@ -67,6 +72,7 @@ fn vs_main(
     out.position = vec4<f32>(v_center + offset, 0., 1.);
     out.screen_pos = position;
     out.color = vec4<f32>(unpack2x16float(vertex.color_0), unpack2x16float(vertex.color_1));
+    out.wall_factor = unpack2x16float(vertex.wall_factor).x;
     return out;
 }
 
@@ -78,9 +84,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     let b = min(0.99, exp(-a) * in.color.a);
     var rgb = in.color.rgb;
-    // Apply real-time wall tint when enabled
+    // Selective wall tint: modulate user strength by wallness score.
+    // smoothstep(0.3, 0.8, wf) → 0 for floors/spherical objects, 1 for clear walls.
     if wall_tint.enabled != 0u {
-        rgb = mix(rgb, wall_tint.rgb_strength.xyz, wall_tint.rgb_strength.w);
+        let wf = smoothstep(0.3, 0.8, in.wall_factor);
+        let effective_strength = wall_tint.rgb_strength.w * wf;
+        rgb = mix(rgb, wall_tint.rgb_strength.xyz, effective_strength);
     }
     return vec4<f32>(rgb, 1.) * b;
 }
