@@ -188,3 +188,20 @@ pnpm --filter @vb/web
 plylancemcpserver
 
 WSGL
+
+Normalized Device Coordinates (NDC)
+
+Use:
+
+PLY → for geometry / segmentation / precision
+GLB (GLTF binary) → for rendering / UI / materials
+
+👉 Think of it like this:
+
+PLY = “data model”
+GLB = “visual + interactive model”
+
+OrbitControls
+Light source optional
+raycasting
+material replacement.

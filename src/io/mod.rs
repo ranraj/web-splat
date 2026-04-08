@@ -11,10 +11,12 @@ use crate::pointcloud::{Aabb, Covariance3D, Gaussian, GaussianCompressed, Gaussi
 use self::npz::NpzReader;
 
 use self::ply::PlyReader;
+use self::spz::SpzReader;
 
 #[cfg(feature = "npz")]
 pub mod npz;
 pub mod ply;
+pub mod spz;
 
 pub trait PointCloudReader {
     fn read(&mut self) -> Result<GenericGaussianPointCloud, anyhow::Error>;
@@ -55,6 +57,10 @@ impl GenericGaussianPointCloud {
             let mut reader = BufReader::new(f);
             let mut npz_reader = NpzReader::new(&mut reader)?;
             return npz_reader.read();
+        }
+        if signature.starts_with(SpzReader::magic_bytes()) {
+            let mut spz_reader = SpzReader::new(f)?;
+            return spz_reader.read();
         }
         return Err(anyhow::anyhow!("Unknown file format"));
     }

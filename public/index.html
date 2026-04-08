@@ -321,7 +321,7 @@
         <div class="navbar-right">
             <form class="navbar-uploader" id="navbar-uploader" onsubmit="return false;">
                 <label>Point cloud
-                    <input id="nav-pc-upload" type="file" accept=".ply,.npz" />
+                    <input id="nav-pc-upload" type="file" accept=".ply,.npz,.spz" />
                 </label>
                 <label>Scene
                     <input id="nav-scene-upload" type="file" accept=".json,application/json" />
@@ -533,7 +533,7 @@
                 let sceneLocalFile = sceneUpload.files && sceneUpload.files[0];
 
                 if (!pcLocalFile) {
-                    showError(new Error("Please select a point cloud file (.ply or .npz)."), "");
+                    showError(new Error("Please select a point cloud file (.ply, .npz, or .spz)."), "");
                     noFilePane.style.display = "flex";
                     return;
                 }

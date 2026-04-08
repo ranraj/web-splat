@@ -4519,6 +4519,7 @@ dependencies = [
  "egui-winit",
  "egui_plot",
  "env_logger",
+ "flate2",
  "futures-intrusive",
  "getrandom 0.4.1",
  "half",

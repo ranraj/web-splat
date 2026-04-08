@@ -37,6 +37,7 @@ egui_plot = "0.35.0"
 rand = "0.10.0"
 vb_auto_camera = { path = "../../packages/auto_camera" }
 npyz = { version = "0.8.4", features = ["npz", "half"], optional = true }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 futures-intrusive = "0.5.0"
 splines = { features = [
     "cgmath",
