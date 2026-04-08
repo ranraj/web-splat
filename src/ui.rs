@@ -451,6 +451,7 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
     let playing = state.animation.as_ref().map(|(_, p)| *p).unwrap_or(false);
     let mut cinematic_toggle: Option<bool> = None;
     let mut return_to_origin = false;
+    let mut rotate_90_pending = false;
 
     let ctrl: &mut CameraController = &mut state.controller;
     let btn_stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
@@ -707,6 +708,12 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
                                     return_to_origin = true;
                                 }
 
+                                // Rotate 90° clockwise around world-up axis
+                                let r_rot90 = wbtn(ui, "⟳90°", false);
+                                if r_rot90.clicked() {
+                                    rotate_90_pending = true;
+                                }
+
                                 // Play / Pause cinematic animation
                                 let label = if playing { "Pause" } else { "Play" };
                                 let r = wbtn(ui, label, playing);
@@ -737,6 +744,11 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
     // Apply return to origin by calling auto_frame_scene.
     if return_to_origin {
         crate::auto_frame_scene();
+    }
+
+    // Rotate 90° clockwise — applied after the egui closure so `ctrl` borrow is released.
+    if rotate_90_pending {
+        crate::rotate_view_90_wasm();
     }
 }
 

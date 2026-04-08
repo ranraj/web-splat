@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_arch = "wasm32")]
 use web_time::{Duration, Instant};
 
-use cgmath::{EuclideanSpace, Point3, Quaternion, Rotation, UlpsEq, Vector2, Vector3};
+use cgmath::{EuclideanSpace, InnerSpace, Point3, Quaternion, Rotation, Rotation3, UlpsEq, Vector2, Vector3};
 use egui::FullOutput;
 use vb_auto_camera::{AutoCamera, CameraHint, SceneAnalysis};
 
@@ -996,7 +996,15 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 let back_dist = radius * 0.12;
                 let eye_rise  = radius * 0.063;
                 let look_dir = floor_projected_direction(Vector3::unit_z(), world_up);
-                let camera_offset = -look_dir * back_dist + world_up * eye_rise;
+                // Use the same outdoor-detection heuristic as vb_auto_camera:
+                // when the centroid is near the floor (sky_extent >> floor_extent),
+                // rise toward sky (-world_up) so the camera isn't placed underground.
+                let bbox = state.pc.bbox();
+                let sky_extent   = centroid.y - bbox.min.y;
+                let floor_extent = bbox.max.y - centroid.y;
+                let centroid_near_floor = sky_extent > floor_extent * 2.5 && sky_extent > 0.01;
+                let rise_dir = if centroid_near_floor { -world_up } else { world_up };
+                let camera_offset = -look_dir * back_dist + rise_dir * eye_rise;
                 let camera_rotation = Quaternion::look_at(look_dir, world_up);
                 state.splatting_args.camera.position = centroid + camera_offset;
                 state.splatting_args.camera.rotation = camera_rotation;
@@ -1008,6 +1016,28 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                     centroid,
                     radius
                 );
+                state.window.request_redraw();
+            }
+
+            // Check if JS called rotate_view_90_wasm() — orbit 90° around world_up.
+            if PENDING_ROTATE_90.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), false)) {
+                let world_up = robust_scene_up(&state.pc);
+                let center   = state.controller.center;
+                // Build a 90° clockwise rotation quaternion around world_up.
+                // Clockwise from the top means negative angle in right-hand coords.
+                let rot90 = Quaternion::from_axis_angle(world_up, cgmath::Rad(-std::f32::consts::FRAC_PI_2));
+                // Orbit the camera position around the center point.
+                let cam_offset = state.splatting_args.camera.position - center;
+                let new_offset = rot90.rotate_vector(cam_offset);
+                let new_pos    = center + new_offset;
+                // Look back at center with the same world_up so horizon stays level.
+                let new_look_dir = (center - new_pos).normalize();
+                state.splatting_args.camera.position = new_pos;
+                state.splatting_args.camera.rotation = Quaternion::look_at(new_look_dir, world_up);
+                state.splatting_args.camera.fit_near_far(state.pc.bbox());
+                // Keep the controller in sync so subsequent orbit drags behave correctly.
+                state.controller.up = Some(world_up);
+                state.animation = None; // cancel any running cinematic pan
                 state.window.request_redraw();
             }
 
@@ -1214,6 +1244,14 @@ thread_local! {
         std::cell::RefCell::new(false);
 }
 
+/// Signal from JS to rotate the camera 90° clockwise around the scene up axis.
+/// Each click increments a counter; 4 clicks = 360° = back to initial yaw.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_ROTATE_90: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+}
+
 /// Caches [cx, cy, cz, radius] for the currently loaded point cloud so that
 /// `get_scene_bounds()` can return them synchronously from JS.
 #[cfg(target_arch = "wasm32")]
@@ -1264,6 +1302,18 @@ pub fn auto_frame_scene() {
 #[wasm_bindgen]
 pub fn return_to_origin() {
     PENDING_RETURN_TO_ORIGIN.with(|cell| {
+        *cell.borrow_mut() = true;
+    });
+}
+
+/// Rotate the camera 90° clockwise around the scene's vertical (world-up) axis.
+///
+/// The orbit pivot stays fixed at `controller.center` (the scene centroid).
+/// Calling this 4 times brings the camera back to its original yaw.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn rotate_view_90_wasm() {
+    PENDING_ROTATE_90.with(|cell| {
         *cell.borrow_mut() = true;
     });
 }
