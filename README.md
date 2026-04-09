@@ -74,8 +74,8 @@ Pod	Controls
 Move Camera D-pad	W / A / S / D
 Rotate Camera D-pad	↑ ↓ ← → (Arrow keys)
 Tilt Camera	Z (⟲L) / X (⟳R)
-Altitude	E (up) / Q (down)
 Zoom	+/– (fires WheelEvent on canvas)
+Altitude	E (up) / Q (down)
 Move Target mini D-pad	I / J / K / L
 
 

@@ -474,7 +474,7 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
         let tip = 26.0_f32;
         for &d in &["up", "down", "left", "right"] {
             let active = dir == Some(d);
-            let col = if active { egui::Color32::WHITE } else { egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200) };
+            let col = if active { egui::Color32::WHITE } else { lbl_col };
             let cs = egui::Stroke::new(2.5, col);
             let (px, py) = match d {
                 "up"   => (c.x, c.y - tip),
@@ -496,7 +496,7 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
 
     // Standard circular d-pad — 110×110, returns (up, dn, lt, rt).
     let dpad = |ui: &mut egui::Ui| -> (bool, bool, bool, bool) {
-        let size = 110.0_f32;
+        let size = 88.0_f32;
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
         let mut dir: Option<&str> = None;
         if ui.is_rect_visible(rect) {
@@ -514,7 +514,7 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
                 }
             }
             let painter = ui.painter();
-            painter.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(110, 10, 10, 110));
+            painter.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(12, 14, 22, 160));
             draw_dpad_circle(painter, c, dir);
         }
         (dir == Some("up"), dir == Some("down"), dir == Some("left"), dir == Some("right"))
@@ -554,7 +554,7 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
                     pod_lbl(ui, "MOVE CAMERA");
-                    let size = 110.0_f32;
+                    let size = 88.0_f32;
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
                     let mut dir: Option<&str> = None;
                     if ui.is_rect_visible(rect) {
@@ -572,7 +572,7 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
                             }
                         }
                         let painter = ui.painter();
-                        painter.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(110, 10, 10, 110));
+                        painter.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(12, 14, 22, 160));
                         draw_dpad_circle(painter, c, dir);
                     }
                     ctrl.process_keyboard(KeyCode::KeyW, dir == Some("up"));
@@ -585,7 +585,7 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
                     pod_lbl(ui, "ROTATE CAMERA");
-                    let size = 110.0_f32;
+                    let size = 88.0_f32;
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
                     let mut dir: Option<&str> = None;
                     if ui.is_rect_visible(rect) {
@@ -603,15 +603,15 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
                             }
                         }
                         let painter = ui.painter();
-                        painter.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(110, 10, 10, 110));
+                        painter.circle_filled(c, radius, egui::Color32::from_rgba_unmultiplied(12, 14, 22, 160));
                         draw_dpad_circle(painter, c, dir);
                         // Camera icon
                         let cam_w = 28.0_f32;
                         let cam_h = 16.0_f32;
                         let cam_rect = egui::Rect::from_center_size(c, egui::vec2(cam_w, cam_h));
-                        let body_col = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180);
-                        ui.painter().rect(cam_rect, 3.0, body_col, egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Inside);
-                        ui.painter().circle_filled(c, 5.0, egui::Color32::from_rgba_unmultiplied(110, 10, 10, 220));
+                        let body_col = lbl_col;
+                        ui.painter().rect(cam_rect, 3.0, body_col, egui::Stroke::new(2.0, lbl_col), egui::StrokeKind::Inside);
+                        ui.painter().circle_filled(c, 5.0, lbl_col);
                         let vf = egui::Rect::from_center_size(
                             egui::pos2(c.x - cam_w * 0.25, c.y - cam_h * 0.6),
                             egui::vec2(7.0, 5.0),
@@ -697,13 +697,13 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                let r = wbtn(ui, "+", false);
+                                let r = wbtn(ui, "🔍", false);
                                 if r.is_pointer_button_down_on() { ctrl.process_scroll(3.0); }
-                                let r = wbtn(ui, "-", false);
+                                let r = wbtn(ui, "🔎", false);
                                 if r.is_pointer_button_down_on() { ctrl.process_scroll(-3.0); }
 
                                 // Return to Origin button (resets camera to initial frame)
-                                let r_origin = wbtn(ui, "↻", false);
+                                let r_origin = wbtn(ui, "◎", false);
                                 if r_origin.clicked() {
                                     return_to_origin = true;
                                 }
