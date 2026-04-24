@@ -90,3 +90,9 @@ cargo check --target wasm32-unknown-unknown --lib 2>&1 | Tee-Object -Variable ou
 Move Camera: Moves the camera's position in the 3D world (W/A/S/D = forward/left/back/right). The camera itself moves, so your viewpoint changes, but the point you are looking at (the target) may move with you or stay fixed depending on the camera mode.
 
 Move Target: Moves the "target" or "center" point that the camera is looking at, without moving the camera's position. This shifts what the camera is focused on, like panning the center of rotation or interest, but the camera stays in place.
+
+
+Deploy docker : 
+cp /mnt/c/Users/Ranjithraj/Documents/Projects/realities-project/VirtualBhoomi-app/docker-deploy-prod.sh /tmp/docker-deploy-prod.sh && sed -i 's/\r//' /tmp/docker-deploy-prod.sh && bash /tmp/docker-deploy-prod.sh
+
+winget install Gyan.FFmpeg

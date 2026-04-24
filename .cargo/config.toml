@@ -1,0 +1,6 @@
+# getrandom (via transitive deps) needs this cfg on wasm32 so the JS backend is
+# selected at compile time. Keeping it here avoids fragile RUSTFLAGS quoting in
+# build_wasm.bat on Windows cmd.exe.
+
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

@@ -21,11 +21,9 @@
 //                 numPoints * 3 bytes (first-three quaternion, v<3)
 //     sh:         numPoints * shDim * 3 bytes (uint8, higher-order SH bands)
 //
-// SPZ internally stores data in RUB (Right-Up-Back) coordinates. Since this renderer
-// expects the 3DGS/OpenCV convention (RDF: Right-Down-Forward), we apply the
-// coordinate conversion: position (x, -y, -z), quaternion (w, x, -y, -z).
-// SH higher-order coefficients are also sign-flipped for the Y and Z axis flip
-// (equivalent to a π rotation around the X axis).
+// SPZ internally stores data in RUB (Right-Up-Back) coordinates.
+// This renderer uses Y-up world space (same as standard 3DGS PLY), which is identical
+// to RUB, so no coordinate conversion is needed. Positions and quaternions are used as-is.
 
 use std::io::Read;
 
@@ -46,21 +44,7 @@ const COLOR_SCALE: f32 = 0.15;
 // 1 / sqrt(2), used in quaternion smallest-three decoding
 const SQRT_1_2: f32 = 0.70710678118654752;
 
-// Sign flip table for real spherical harmonics under a π rotation around the X axis
-// (i.e. the RUB → RDF coordinate conversion where Y and Z are negated).
-// Indexed by SH coefficient index j (0-based, excluding DC):
-//   j = 0..2  : degree 1 (m = -1, 0, +1)
-//   j = 3..7  : degree 2 (m = -2, -1, 0, +1, +2)
-//   j = 8..14 : degree 3 (m = -3, -2, -1, 0, +1, +2, +3)
-const SH_FLIP_RUB_TO_RDF: [f32; 15] = [
-    // degree 1: Y_1^{-1} ∝y (-1), Y_1^0 ∝z (-1), Y_1^1 ∝x (+1)
-    -1.0, -1.0, 1.0,
-    // degree 2: xy(-1), yz(+1), 2z²-x²-y²(+1), xz(-1), x²-y²(+1)
-    -1.0, 1.0, 1.0, -1.0, 1.0,
-    // degree 3: y(3x²-y²)(-1), xyz(+1), y(4z²-x²-y²)(-1),
-    //           z(2z²-3x²-3y²)(-1), x(4z²-x²-y²)(+1), z(x²-y²)(-1), x(x²-3y²)(+1)
-    -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0,
-];
+// No SH sign flips needed: no coordinate conversion is applied.
 
 /// Number of higher-order SH coefficients per point per colour channel for a given degree.
 /// This excludes the DC term (degree 0), which is stored separately in the `colors` array.
@@ -222,8 +206,8 @@ impl PointCloudReader for SpzReader {
                 let z = decode_fixed24(&p[6..9], scale_inv);
                 (x, y, z)
             };
-            // RUB → RDF: negate Y and Z
-            let pos = Point3::new(px, -py, -pz);
+            // No conversion: SPZ uses Y-up (RUB) which matches this renderer's Y-up world space.
+            let pos = Point3::new(px, py, pz);
 
             // Opacity: packed as sigmoid(logit) * 255 → actual opacity in [0,1]
             let opacity = alphas_raw[n] as f32 / 255.0;
@@ -243,8 +227,8 @@ impl PointCloudReader for SpzReader {
             } else {
                 decode_quaternion_first_three(&rotations_raw[n * 3..])
             };
-            // RUB → RDF quaternion: (w, x, -y, -z)  [y and z components negate]
-            let rot = Quaternion::new(rot_xyzw[3], rot_xyzw[0], -rot_xyzw[1], -rot_xyzw[2])
+            // No conversion: quaternion used as-is since both SPZ and PLY use Y-up world space.
+            let rot = Quaternion::new(rot_xyzw[3], rot_xyzw[0], rot_xyzw[1], rot_xyzw[2])
                 .normalize();
 
             let cov = build_cov(rot, scale);
@@ -268,14 +252,13 @@ impl PointCloudReader for SpzReader {
             if sh_dim > 0 {
                 let base = n * sh_dim * 3;
                 for j in 0..sh_dim {
-                    let flip = SH_FLIP_RUB_TO_RDF.get(j).copied().unwrap_or(1.0);
                     let k = base + j * 3;
                     sh_out[j + 1][0] =
-                        f16::from_f32(flip * (sh_raw[k] as f32 - 128.0) / 128.0);
+                        f16::from_f32((sh_raw[k] as f32 - 128.0) / 128.0);
                     sh_out[j + 1][1] =
-                        f16::from_f32(flip * (sh_raw[k + 1] as f32 - 128.0) / 128.0);
+                        f16::from_f32((sh_raw[k + 1] as f32 - 128.0) / 128.0);
                     sh_out[j + 1][2] =
-                        f16::from_f32(flip * (sh_raw[k + 2] as f32 - 128.0) / 128.0);
+                        f16::from_f32((sh_raw[k + 2] as f32 - 128.0) / 128.0);
                 }
             }
 

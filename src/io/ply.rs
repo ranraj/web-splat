@@ -19,6 +19,7 @@ pub struct PlyReader<R: Read + Seek> {
     reader: BufReader<R>,
     sh_deg: u32,
     num_points: usize,
+    has_normals: bool,
     mip_splatting: Option<bool>,
     kernel_size: Option<f32>,
     background_color: Option<[f32; 3]>,
@@ -28,9 +29,10 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
     pub fn new(reader: R) -> Result<Self, anyhow::Error> {
         let mut reader = BufReader::new(reader);
         let parser = ply_rs::parser::Parser::<ply_rs::ply::DefaultElement>::new();
-        let header = parser.read_header(&mut reader).unwrap();
+        let header = parser.read_header(&mut reader)?;
         let sh_deg = Self::file_sh_deg(&header)?;
         let num_points = Self::num_points(&header)?;
+        let has_normals = Self::has_normals(&header);
         let mip_splatting = Self::mip_splatting(&header)?;
         let kernel_size = Self::kernel_size(&header)?;
         let background_color = Self::background_color(&header)
@@ -41,6 +43,7 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
             reader,
             sh_deg,
             num_points,
+            has_normals,
             mip_splatting,
             kernel_size,
             background_color,
@@ -54,11 +57,12 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
         let mut pos = [0.; 3];
         self.reader.read_f32_into::<B>(&mut pos)?;
 
-        // skip normals
-        // for what ever reason it is faster to call read than seek ...
-        // so we just read them and never use them again
-        let mut _normals = [0.; 3];
-        self.reader.read_f32_into::<B>(&mut _normals)?;
+        if self.has_normals {
+            // Skip normals when present in the vertex layout.
+            // Some exporters (e.g. gsplat variants) omit nx/ny/nz.
+            let mut _normals = [0.; 3];
+            self.reader.read_f32_into::<B>(&mut _normals)?;
+        }
 
         let mut sh: [[f32; 3]; 16] = [[0.; 3]; 16];
         self.reader.read_f32_into::<B>(&mut sh[0])?;
@@ -118,6 +122,17 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
             .get("vertex")
             .ok_or(anyhow::anyhow!("missing element vertex"))?
             .count as usize)
+    }
+
+    fn has_normals(header: &ply::Header) -> bool {
+        header
+            .elements
+            .get("vertex")
+            .is_some_and(|vertex| {
+                vertex.properties.contains_key("nx")
+                    && vertex.properties.contains_key("ny")
+                    && vertex.properties.contains_key("nz")
+            })
     }
 
     fn mip_splatting(header: &ply::Header) -> Result<Option<bool>, anyhow::Error> {

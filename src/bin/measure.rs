@@ -171,7 +171,7 @@ async fn main() {
     let scene = Scene::from_json(scene_file).unwrap();
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-    let wgpu_context = WGPUContext::new(&instance, None).await;
+    let wgpu_context = WGPUContext::new(&instance, None).await.unwrap();
     let device = &wgpu_context.device;
     let queue = &wgpu_context.queue;
 

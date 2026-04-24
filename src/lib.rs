@@ -66,10 +66,30 @@ pub struct WGPUContext {
 }
 
 impl WGPUContext {
-    pub async fn new(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'static>>) -> Self {
+    /// Convenience constructor for headless (no-surface) native usage.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn new_instance() -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(
+            wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+        );
+        Self::new(&instance, None).await
+    }
+
+    pub async fn new(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'static>>) -> anyhow::Result<Self> {
         let adapter = wgpu::util::initialize_adapter_from_env_or_default(instance, surface)
             .await
-            .unwrap();
+            .map_err(|e| anyhow::anyhow!(
+                "No WebGPU adapter found: {:?}.\n\
+                 Common causes:\n\
+                 - The page is not a secure context. WebGPU only works on https://, \
+                   http://localhost, http://127.0.0.1 or http://[::1]. A LAN IP \
+                   like http://192.168.x.x:3000 will fail silently here. Open the \
+                   app via http://localhost:<port> instead, or serve it over HTTPS.\n\
+                 - The browser does not support WebGPU. Use Chrome 113+ or Edge 113+ \
+                   on Windows / macOS / ChromeOS / Android.\n\
+                 - The GPU is on the driver blocklist (try updating GPU drivers).",
+                e
+            ))?;
         log::info!("using apdater \"{}\"", adapter.get_info().name);
 
         #[cfg(target_arch = "wasm32")]
@@ -104,13 +124,13 @@ impl WGPUContext {
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
             .await
-            .unwrap();
+            .map_err(anyhow::Error::from)?;
 
-        Self {
+        Ok(Self {
             device,
             queue,
             adapter,
-        }
+        })
     }
 }
 
@@ -163,13 +183,18 @@ impl WindowContext {
 
         let window = Arc::new(window);
 
+        // Do not use `new_instance_with_webgpu_detection` on wasm: its probe can
+        // return false negatives, and wgpu then drops `BROWSER_WEBGPU` from the
+        // instance so `request_adapter` only asks for Vulkan/GL/Metal/DX12 —
+        // impossible in the browser (matches NotFound with no WebGPU in
+        // `requested_backends`). Gauzilla / vb-renderer use plain `Instance::new`.
         let instance = wgpu::Instance::new(
             wgpu::InstanceDescriptor::new_with_display_handle_from_env(window.clone_for_wgpu()),
         );
 
         let surface: wgpu::Surface = instance.create_surface(window.clone())?;
 
-        let wgpu_context = WGPUContext::new(&instance, Some(&surface)).await;
+        let wgpu_context = WGPUContext::new(&instance, Some(&surface)).await?;
 
         let device = &wgpu_context.device;
         let queue = &wgpu_context.queue;
@@ -907,8 +932,27 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
             .and_then(|body| {
                 let canvas = window.canvas().unwrap();
                 canvas.set_id("window-canvas");
-                canvas.set_width(body.client_width() as u32);
-                canvas.set_height(body.client_height() as u32);
+                // Next.js / React can call us before layout: `body.client_*` is often 0 here.
+                // A 0×0 canvas makes `request_adapter` with a compatible surface fail (NotFound).
+                let win = web_sys::window()?;
+                let vw = win
+                    .inner_width()
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .map(|x| x.round().max(1.0) as u32)
+                    .unwrap_or(800);
+                let vh = win
+                    .inner_height()
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .map(|x| x.round().max(1.0) as u32)
+                    .unwrap_or(600);
+                let bw = body.client_width().max(0) as u32;
+                let bh = body.client_height().max(0) as u32;
+                let cw = bw.max(vw).max(1);
+                let ch = bh.max(vh).max(1);
+                canvas.set_width(cw);
+                canvas.set_height(ch);
                 let elm = web_sys::Element::from(canvas);
                 elm.set_attribute("style", "width: 100%; height: 100%;")
                     .unwrap();
@@ -926,7 +970,27 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
         })
         .unwrap_or(Duration::from_millis(17));
 
-    let mut state = WindowContext::new(window, file, &config).await.unwrap();
+    let mut state = match WindowContext::new(window, file, &config).await {
+        Ok(state) => state,
+        Err(err) => {
+            log::error!("failed to initialize renderer: {:?}", err);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let msg = format!("Failed to load point cloud: {}", err);
+                let _ = web_sys::window()
+                    .and_then(|win| win.document())
+                    .map(|doc| {
+                        if let Some(elm) = doc.get_element_by_id("loading-display") {
+                            elm.set_text_content(Some(&msg));
+                        }
+                        if let Some(spinner) = doc.get_element_by_id("spinner") {
+                            let _ = spinner.set_attribute("style", "display:none;");
+                        }
+                    });
+            }
+            return;
+        }
+    };
     state.pointcloud_file_path = pointcloud_file_path;
 
     if let Some(scene) = scene {
