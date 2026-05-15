@@ -11,9 +11,12 @@ use std::time::{Duration, Instant};
 #[cfg(target_arch = "wasm32")]
 use web_time::{Duration, Instant};
 
-use cgmath::{EuclideanSpace, InnerSpace, Point3, Quaternion, Rotation, Rotation3, UlpsEq, Vector2, Vector3};
+use cgmath::{
+    EuclideanSpace, InnerSpace, Point3, Quaternion, Rotation, Rotation3, UlpsEq, Vector2, Vector3,
+};
 use egui::FullOutput;
-use vb_auto_camera::{AutoCamera, CameraHint, SceneAnalysis};
+use vb_auto_camera::{AutoCamera, SceneAnalysis};
+pub use vb_auto_camera::CameraHint;
 
 #[cfg(not(target_arch = "wasm32"))]
 use utils::RingBuffer;
@@ -37,7 +40,7 @@ pub use camera::{Camera, PerspectiveCamera, PerspectiveProjection};
 mod controller;
 pub use controller::CameraController;
 mod pointcloud;
-pub use pointcloud::PointCloud;
+pub use pointcloud::{Aabb, PointCloud};
 
 pub mod io;
 
@@ -53,6 +56,11 @@ pub mod gpu_rs;
 mod ui_renderer;
 mod uniform;
 mod utils;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod headless_thumbnail;
+#[cfg(not(target_arch = "wasm32"))]
+pub use headless_thumbnail::{render_ply_panorama_strip_rgb, render_ply_thumbnail_rgb};
 
 pub struct RenderConfig {
     pub no_vsync: bool,
@@ -90,7 +98,7 @@ impl WGPUContext {
                  - The GPU is on the driver blocklist (try updating GPU drivers).",
                 e
             ))?;
-        log::info!("using apdater \"{}\"", adapter.get_info().name);
+        log::info!("using adapter \"{}\"", adapter.get_info().name);
 
         #[cfg(target_arch = "wasm32")]
         let required_features = wgpu::Features::default();
@@ -142,6 +150,11 @@ pub struct WindowContext {
     scale_factor: f32,
 
     pc: PointCloud,
+    /// Same opacity-weighted inlier stats as `auto_frame_from_raw` / `vb_auto_camera`.
+    /// Used for depth clip (`fit_near_far`) so a handful of far stray Gaussians do not
+    /// dominate the projection matrix (otherwise the interior cluster can sit entirely
+    /// inside the near-clip shell and nothing draws).
+    scene_analysis: SceneAnalysis,
     pointcloud_file_path: Option<PathBuf>,
     renderer: GaussianRenderer,
     animation: Option<(Animation<PerspectiveCamera>, bool)>,
@@ -235,8 +248,8 @@ impl WindowContext {
         // ── Auto-frame via vb_auto_camera (same algorithm as thumbnail.rs) ──────────────
         // Uses opacity-weighted scene analysis — more robust than the old centroid+radius
         // heuristic — so the initial view matches the thumbnail exactly.
-        let (view_camera, centroid, world_up) =
-            auto_frame_from_raw(&pc_raw, size.width, size.height);
+        let (view_camera, centroid, world_up, scene_analysis) =
+            auto_frame_from_raw(&pc_raw, size.width, size.height, CameraHint::Auto);
         let pc = PointCloud::new(&device, pc_raw)?;
         log::info!("loaded point cloud with {:} points", pc.num_points());
 
@@ -290,6 +303,7 @@ impl WindowContext {
                 background_color: wgpu::Color::BLACK,
             },
             pc,
+            scene_analysis,
             // camera: view_camera,
             controller,
             ui_renderer,
@@ -318,6 +332,7 @@ impl WindowContext {
             log::info!("reloading volume from {:?}", file_path);
             let file = std::fs::File::open(file_path)?;
             let pc_raw = io::GenericGaussianPointCloud::load(file)?;
+            self.scene_analysis = scene_analysis_for_raw(&pc_raw);
             self.pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
         } else {
             return Err(anyhow::anyhow!("no pointcloud file path present"));
@@ -340,8 +355,9 @@ impl WindowContext {
     ) -> anyhow::Result<()> {
         use std::io::Cursor;
         let pc_raw = io::GenericGaussianPointCloud::load(Cursor::new(pc_bytes))?;
-        let (new_camera, centroid, world_up) =
-            auto_frame_from_raw(&pc_raw, self.config.width, self.config.height);
+        let (new_camera, centroid, world_up, scene_analysis) =
+            auto_frame_from_raw(&pc_raw, self.config.width, self.config.height, CameraHint::Auto);
+        self.scene_analysis = scene_analysis;
         self.pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
         self.splatting_args.camera = new_camera;
         // Mirror exactly what WindowContext::new does — just set center, no reset_to_camera.
@@ -417,6 +433,8 @@ impl WindowContext {
     /// returns whether the sceen changed and we need a redraw
     fn update(&mut self, dt: Duration) {
         // ema fps update
+        #[cfg(target_arch = "wasm32")]
+        let dt = dt.min(Duration::from_millis(250));
 
         if self.splatting_args.walltime < Duration::from_secs(5) {
             self.splatting_args.walltime += dt;
@@ -461,8 +479,48 @@ impl WindowContext {
             }
         }
 
-        let aabb = self.pc.bbox();
-        self.splatting_args.camera.fit_near_far(aabb);
+        let clip_aabb = clip_aabb_from_scene_analysis(&self.scene_analysis);
+        self.splatting_args.camera.fit_near_far(&clip_aabb);
+    }
+
+    /// Re-frame the camera like initial load / JS `auto_frame_scene()` (gamepad + WASM).
+    pub(crate) fn apply_auto_frame_scene(&mut self) {
+        let (mut cam, centroid, world_up) = perspective_camera_from_scene_analysis(
+            &self.scene_analysis,
+            self.config.width,
+            self.config.height,
+            CameraHint::Auto,
+        );
+        cam.fit_near_far(&clip_aabb_from_scene_analysis(&self.scene_analysis));
+        self.splatting_args.camera = cam;
+        self.controller.center = centroid;
+        self.controller.up = Some(world_up);
+        log::info!(
+            "auto_frame_scene: centroid={:?} radius={:.3} (vb_auto p90)",
+            centroid,
+            self.scene_analysis.radius
+        );
+        self.window.request_redraw();
+    }
+
+    /// Orbit the camera 90° clockwise around the scene up axis (gamepad + WASM).
+    pub(crate) fn apply_rotate_view_90_clockwise(&mut self) {
+        let world_up = robust_scene_up(&self.pc);
+        let center = self.controller.center;
+        let rot90 =
+            Quaternion::from_axis_angle(world_up, cgmath::Rad(-std::f32::consts::FRAC_PI_2));
+        let cam_offset = self.splatting_args.camera.position - center;
+        let new_offset = rot90.rotate_vector(cam_offset);
+        let new_pos = center + new_offset;
+        let new_look_dir = (center - new_pos).normalize();
+        self.splatting_args.camera.position = new_pos;
+        self.splatting_args.camera.rotation = Quaternion::look_at(new_look_dir, world_up);
+        self.splatting_args
+            .camera
+            .fit_near_far(&clip_aabb_from_scene_analysis(&self.scene_analysis));
+        self.controller.up = Some(world_up);
+        self.animation = None;
+        self.window.request_redraw();
     }
 
     fn render(
@@ -741,18 +799,21 @@ fn robust_scene_up(pc: &PointCloud) -> Vector3<f32> {
     // suspenders sign check here handles any edge case.
     if let Some(pca) = pca_up {
         let n = pca.normalize();
-        if n.y.abs() >= 0.5 {
+        if !n.x.is_finite() || !n.y.is_finite() || !n.z.is_finite() {
+            log::info!("robust_scene_up: PCA direction non-finite, skipping");
+        } else if n.y.abs() >= 0.5 {
             let up = if n.y >= 0.0 { n } else { -n };
             log::info!(
                 "robust_scene_up: PCA ({:.4},{:.4},{:.4}) — using it",
                 up.x, up.y, up.z
             );
             return up;
+        } else {
+            log::info!(
+                "robust_scene_up: PCA ({:.4},{:.4},{:.4}) too horizontal (|Y|<0.5), skipping",
+                n.x, n.y, n.z
+            );
         }
-        log::info!(
-            "robust_scene_up: PCA ({:.4},{:.4},{:.4}) too horizontal (|Y|<0.5), skipping",
-            n.x, n.y, n.z
-        );
     }
 
     // ── Priority 2: AABB, only when Y is unambiguously shortest ────────────
@@ -779,19 +840,6 @@ fn robust_scene_up(pc: &PointCloud) -> Vector3<f32> {
     Vector3::unit_y()
 }
 
-/// Project `base_dir` onto the floor plane (perpendicular to `up`) and normalise.
-/// Falls back to +X if `base_dir` is nearly parallel to `up`.
-fn floor_projected_direction(base_dir: Vector3<f32>, up: Vector3<f32>) -> Vector3<f32> {
-    use cgmath::InnerSpace;
-    let proj = base_dir - up * up.dot(base_dir);
-    if proj.magnitude() > 0.1 {
-        proj.normalize()
-    } else {
-        let alt = Vector3::unit_x();
-        (alt - up * up.dot(alt)).normalize()
-    }
-}
-
 pub fn smoothstep(x: f32) -> f32 {
     return x * x * (3.0 - 2.0 * x);
 }
@@ -814,18 +862,43 @@ fn snap_to_cardinal_cgmath(v: Vector3<f32>) -> Vector3<f32> {
     }
 }
 
-/// Build a `PerspectiveCamera` using `vb_auto_camera` — the same algorithm used
-/// by `thumbnail.rs` — so the web viewer's initial framing matches the thumbnail.
-fn auto_frame_from_raw(
-    pc_raw: &io::GenericGaussianPointCloud,
+/// Inlier axis-aligned box from `vb_auto_camera` (median + 2×p90 filter). Using this for
+/// `PerspectiveCamera::fit_near_far` matches the numeric scale of the auto-framed cluster,
+/// unlike [`PointCloud::bbox`] which includes arbitrary far outliers.
+pub fn clip_aabb_from_scene_analysis(analysis: &SceneAnalysis) -> Aabb<f32> {
+    Aabb::new(
+        Point3::new(
+            analysis.bb_min.x(),
+            analysis.bb_min.y(),
+            analysis.bb_min.z(),
+        ),
+        Point3::new(
+            analysis.bb_max.x(),
+            analysis.bb_max.y(),
+            analysis.bb_max.z(),
+        ),
+    )
+}
+
+fn scene_analysis_for_raw(pc_raw: &io::GenericGaussianPointCloud) -> SceneAnalysis {
+    let (positions, opacities) = pc_raw.positions_and_opacities();
+    let weights: Option<&[f32]> = if opacities.is_empty() {
+        None
+    } else {
+        Some(&opacities)
+    };
+    SceneAnalysis::from_points(&positions, weights)
+}
+
+/// Build the same perspective camera as initial web load / thumbnail (`AutoCamera::frame`).
+fn perspective_camera_from_scene_analysis(
+    analysis: &SceneAnalysis,
     width: u32,
     height: u32,
+    hint: CameraHint,
 ) -> (PerspectiveCamera, Point3<f32>, Vector3<f32>) {
     use cgmath::Rad;
-    let (positions, opacities) = pc_raw.positions_and_opacities();
-    let weights: Option<&[f32]> = if opacities.is_empty() { None } else { Some(&opacities) };
-    let analysis = SceneAnalysis::from_points(&positions, weights);
-    let auto_cam = AutoCamera::frame(&analysis, width, height, CameraHint::Auto);
+    let auto_cam = AutoCamera::frame(analysis, width, height, hint);
 
     let position = Point3::new(
         auto_cam.position.x(),
@@ -865,6 +938,37 @@ fn auto_frame_from_raw(
         auto_cam.target.z(),
     );
     (camera, centroid, world_up)
+}
+
+/// World-space direction the camera looks along (same convention as [`CameraController`].
+pub fn camera_world_forward(cam: &PerspectiveCamera) -> Vector3<f32> {
+    use cgmath::Rotation;
+    cam.rotation.invert().rotate_vector(Vector3::unit_z()).normalize()
+}
+
+/// Build the same perspective camera the WebGPU viewer uses for initial framing
+/// (`vb_auto_camera` + `Quaternion::look_at`). Used by the `thumbnail` CLI tool.
+pub fn auto_frame_point_cloud(
+    pc_raw: &io::GenericGaussianPointCloud,
+    width: u32,
+    height: u32,
+    hint: CameraHint,
+) -> (PerspectiveCamera, Point3<f32>, Vector3<f32>, SceneAnalysis) {
+    auto_frame_from_raw(pc_raw, width, height, hint)
+}
+
+/// Build a `PerspectiveCamera` using `vb_auto_camera` — the same algorithm used
+/// by the `thumbnail` tool — so the web viewer's initial framing matches the thumbnail.
+fn auto_frame_from_raw(
+    pc_raw: &io::GenericGaussianPointCloud,
+    width: u32,
+    height: u32,
+    hint: CameraHint,
+) -> (PerspectiveCamera, Point3<f32>, Vector3<f32>, SceneAnalysis) {
+    let analysis = scene_analysis_for_raw(pc_raw);
+    let (camera, centroid, world_up) =
+        perspective_camera_from_scene_analysis(&analysis, width, height, hint);
+    (camera, centroid, world_up, analysis)
 }
 
 pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
@@ -1054,55 +1158,12 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 std::mem::replace(&mut *cell.borrow_mut(), false)
             });
             if needs_center {
-                // Re-frame using the same interior-placement formula as WindowContext::new().
-                let (centroid, radius) = state.pc.centroid_and_radius();
-                let world_up = robust_scene_up(&state.pc);
-                let back_dist = radius * 0.12;
-                let eye_rise  = radius * 0.063;
-                let look_dir = floor_projected_direction(Vector3::unit_z(), world_up);
-                // Use the same outdoor-detection heuristic as vb_auto_camera:
-                // when the centroid is near the floor (sky_extent >> floor_extent),
-                // rise toward sky (-world_up) so the camera isn't placed underground.
-                let bbox = state.pc.bbox();
-                let sky_extent   = centroid.y - bbox.min.y;
-                let floor_extent = bbox.max.y - centroid.y;
-                let centroid_near_floor = sky_extent > floor_extent * 2.5 && sky_extent > 0.01;
-                let rise_dir = if centroid_near_floor { -world_up } else { world_up };
-                let camera_offset = -look_dir * back_dist + rise_dir * eye_rise;
-                let camera_rotation = Quaternion::look_at(look_dir, world_up);
-                state.splatting_args.camera.position = centroid + camera_offset;
-                state.splatting_args.camera.rotation = camera_rotation;
-                state.splatting_args.camera.fit_near_far(state.pc.bbox());
-                state.controller.center = centroid;
-                state.controller.up = Some(world_up);
-                log::info!(
-                    "auto_frame_scene: centroid={:?} radius={:.3}",
-                    centroid,
-                    radius
-                );
-                state.window.request_redraw();
+                state.apply_auto_frame_scene();
             }
 
             // Check if JS called rotate_view_90_wasm() — orbit 90° around world_up.
             if PENDING_ROTATE_90.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), false)) {
-                let world_up = robust_scene_up(&state.pc);
-                let center   = state.controller.center;
-                // Build a 90° clockwise rotation quaternion around world_up.
-                // Clockwise from the top means negative angle in right-hand coords.
-                let rot90 = Quaternion::from_axis_angle(world_up, cgmath::Rad(-std::f32::consts::FRAC_PI_2));
-                // Orbit the camera position around the center point.
-                let cam_offset = state.splatting_args.camera.position - center;
-                let new_offset = rot90.rotate_vector(cam_offset);
-                let new_pos    = center + new_offset;
-                // Look back at center with the same world_up so horizon stays level.
-                let new_look_dir = (center - new_pos).normalize();
-                state.splatting_args.camera.position = new_pos;
-                state.splatting_args.camera.rotation = Quaternion::look_at(new_look_dir, world_up);
-                state.splatting_args.camera.fit_near_far(state.pc.bbox());
-                // Keep the controller in sync so subsequent orbit drags behave correctly.
-                state.controller.up = Some(world_up);
-                state.animation = None; // cancel any running cinematic pan
-                state.window.request_redraw();
+                state.apply_rotate_view_90_clockwise();
             }
 
             // Check if JS called start_cinematic_pan_wasm() or stop_cinematic_pan_wasm().

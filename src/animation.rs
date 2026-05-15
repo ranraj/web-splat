@@ -246,24 +246,36 @@ impl<T> Animation<T> {
     }
 
     pub fn update(&mut self, dt: Duration) -> T {
+        if self.duration.is_zero() {
+            return self.sampler.sample(1.0);
+        }
         match self.time_left.checked_sub(dt) {
             Some(new_left) => {
-                // set time left
                 self.time_left = new_left;
             }
             None => {
                 if self.looping {
-                    self.time_left = self.duration + self.time_left - dt;
+                    // `duration + time_left - dt` panics when dt is larger than one period
+                    // (tab background, debugger pause, first frame after load on wasm).
+                    let elapsed_this_cycle = self.duration.saturating_sub(self.time_left);
+                    let total_elapsed = elapsed_this_cycle.saturating_add(dt);
+                    let period = self.duration.as_nanos().max(1);
+                    let rem_nanos = total_elapsed.as_nanos() % period;
+                    self.time_left =
+                        self.duration.saturating_sub(Duration::from_nanos(rem_nanos as u64));
                 } else {
                     self.time_left = Duration::ZERO;
                 }
             }
         }
-        return self.sampler.sample(self.progress());
+        self.sampler.sample(self.progress())
     }
 
     pub fn progress(&self) -> f32 {
-        return 1. - self.time_left.as_secs_f32() / self.duration.as_secs_f32();
+        if self.duration.is_zero() {
+            return 1.0;
+        }
+        1. - self.time_left.as_secs_f32() / self.duration.as_secs_f32()
     }
 
     pub fn set_progress(&mut self, v: f32) {

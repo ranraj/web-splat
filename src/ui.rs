@@ -741,14 +741,12 @@ fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
         }
     }
 
-    // Apply return to origin by calling auto_frame_scene.
+    // Return to origin / rotate 90° — applied after the egui closure so `ctrl` borrow is released.
     if return_to_origin {
-        crate::auto_frame_scene();
+        state.apply_auto_frame_scene();
     }
-
-    // Rotate 90° clockwise — applied after the egui closure so `ctrl` borrow is released.
     if rotate_90_pending {
-        crate::rotate_view_90_wasm();
+        state.apply_rotate_view_90_clockwise();
     }
 }
 

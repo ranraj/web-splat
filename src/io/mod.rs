@@ -2,7 +2,7 @@
 use std::io::BufReader;
 use std::io::{Read, Seek};
 
-use cgmath::{Array, EuclideanSpace, InnerSpace, Point3, Vector3};
+use cgmath::{EuclideanSpace, InnerSpace, Point3, Vector3};
 use half::f16;
 
 use crate::pointcloud::{Aabb, Covariance3D, Gaussian, GaussianCompressed, GaussianQuantization};
@@ -305,12 +305,20 @@ fn plane_from_points(points: &[Point3<f32>]) -> (Point3<f32>, Option<Vector3<f32
         weighted_dir += &axis_dir * weight;
     }
 
+    if !weighted_dir.x.is_finite()
+        || !weighted_dir.y.is_finite()
+        || !weighted_dir.z.is_finite()
+        || weighted_dir.magnitude2() < 1e-30
+    {
+        return (centroid, None);
+    }
+
     let mut normal = weighted_dir.normalize();
 
     if normal.dot(Vector3::unit_y()) < 0. {
         normal = -normal;
     }
-    if normal.is_finite() {
+    if normal.x.is_finite() && normal.y.is_finite() && normal.z.is_finite() {
         (centroid, Some(normal))
     } else {
         (centroid, None)
