@@ -303,6 +303,7 @@ impl CameraController {
         let x_axis = view_t.x;
         let y_axis = self.up.unwrap_or(view_t.y);
         let z_axis = view_t.z;
+        let floor_up = y_axis.normalize();
 
         // 1. FPS WASD/QE/Space walk — moves both camera and orbit pivot together
         let fwd  = (self.move_forward  as i32 - self.move_backward as i32) as f32;
@@ -311,7 +312,10 @@ impl CameraController {
         if fwd != 0.0 || side != 0.0 || vert != 0.0 {
             let speed_mult = if self.shift_pressed { 3.0 } else { 1.0 };
             let walk_speed = self.speed * 2.0 * dt * speed_mult;
-            let raw = z_axis * fwd + x_axis * side - y_axis * vert;
+            // W/S and A/D on the floor plane; E/Q still move along locked up.
+            let walk_fwd = horizontal_walk_axis(z_axis, floor_up).unwrap_or(z_axis);
+            let walk_side = horizontal_walk_axis(x_axis, floor_up).unwrap_or(x_axis);
+            let raw = walk_fwd * fwd + walk_side * side - floor_up * vert;
             let move_vec = if raw.magnitude2() > 1e-6 {
                 raw.normalize() * walk_speed
             } else {
@@ -411,5 +415,22 @@ fn angle_short(a: Vector3<f32>, b: Vector3<f32>) -> Rad<f32> {
         return Rad(PI) - angle;
     } else {
         return angle;
+    }
+}
+
+/// Remove the component along `plane_normal` so W/A/S/D slide on the floor
+/// plane instead of following the pitched view ray (which feels like stepping
+/// down when the camera looks slightly below the horizon).
+fn project_onto_plane(v: Vector3<f32>, plane_normal: Vector3<f32>) -> Vector3<f32> {
+    let n = plane_normal.normalize();
+    v - n * v.dot(n)
+}
+
+fn horizontal_walk_axis(v: Vector3<f32>, floor_up: Vector3<f32>) -> Option<Vector3<f32>> {
+    let flat = project_onto_plane(v, floor_up);
+    if flat.magnitude2() > 1e-8 {
+        Some(flat.normalize())
+    } else {
+        None
     }
 }

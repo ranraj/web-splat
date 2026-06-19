@@ -6,7 +6,9 @@ use web_time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::renderer::DEFAULT_KERNEL_SIZE;
-use crate::{CameraController, SceneCamera, Split, WindowContext};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::CameraController;
+use crate::{SceneCamera, Split, WindowContext};
 use cgmath::{Euler, Matrix3, Quaternion};
 #[cfg(not(target_arch = "wasm32"))]
 use egui::Vec2b;
@@ -15,6 +17,7 @@ use egui::Vec2b;
 use egui::{Align2, Vec2};
 
 use egui::{Color32, RichText, emath::Numeric};
+#[cfg(not(target_arch = "wasm32"))]
 use winit::keyboard::KeyCode;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -406,6 +409,13 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
     } // end ui_visible
 
     // ── Gamepad overlay panel ─────────────────────────────────────
+    //
+    // The egui gamepad pad is only drawn on native desktop builds. On WASM
+    // the React-side `ViewerCameraControls` overlay (in `@vb/viewer`) owns
+    // the on-screen camera chrome — it shares the `gamepad_visible` toggle
+    // via the `vb-viewer-chrome` event so V still flips both viewports' UIs
+    // in lockstep with the measure panel.
+    #[cfg(not(target_arch = "wasm32"))]
     if state.gamepad_visible {
         gamepad_panel(&ctx, state);
     }
@@ -445,6 +455,13 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
 // Buttons are drawn with a dark semi-transparent style.  Held state is tracked
 // via egui's pointer-down test: on each frame the flag is set while the button
 // is being pressed and cleared when released.
+//
+// This panel is intentionally compiled out on WASM — the React-side
+// `ViewerCameraControls` overlay in `packages/viewer` paints a Material-You
+// camera chrome that matches the rest of the Studio toolbar (upload, share,
+// auto-walk) and forwards the same controller signals through the new
+// `set_movement_keys_wasm` / `apply_*_impulse_wasm` exports.
+#[cfg(not(target_arch = "wasm32"))]
 fn gamepad_panel(ctx: &egui::Context, state: &mut WindowContext) {
     // Snapshot animation state BEFORE mutably borrowing controller, so the
     // egui closure below only captures `ctrl` (not `state` itself).

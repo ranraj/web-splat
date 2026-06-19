@@ -36,7 +36,7 @@ mod animation;
 mod ui;
 pub use animation::{Animation, CinematicPan, Sampler, TrackingShot, Transition};
 mod camera;
-pub use camera::{Camera, PerspectiveCamera, PerspectiveProjection};
+pub use camera::{Camera, PerspectiveCamera, PerspectiveProjection, VIEWPORT_Y_FLIP};
 mod controller;
 pub use controller::CameraController;
 mod pointcloud;
@@ -142,6 +142,13 @@ impl WGPUContext {
     }
 }
 
+/// How long a single "snap 90°" rotation takes to ease into the new yaw.
+/// Picked to feel responsive but not snappy — short enough that four
+/// taps back-to-back still feel like discrete steps, long enough that the
+/// motion is legible (the original implementation teleported in one frame
+/// and users couldn't tell which direction the orbit went).
+const SNAP_ROTATE_DURATION_MS: u64 = 450;
+
 pub struct WindowContext {
     wgpu_context: WGPUContext,
     surface: wgpu::Surface<'static>,
@@ -158,6 +165,15 @@ pub struct WindowContext {
     pointcloud_file_path: Option<PathBuf>,
     renderer: GaussianRenderer,
     animation: Option<(Animation<PerspectiveCamera>, bool)>,
+    /// True while `start_cinematic_pan` is the *currently active* animation
+    /// (auto-sweep). Flips back to false when any other animation supersedes
+    /// it OR when the user interacts with the canvas (which causes
+    /// `cancle_animation` to drop the animation in the next frame). Mirrored
+    /// to JS via the `vb-cinematic-pan` window event so the React play/pause
+    /// icon can render its pressed-state accurately — see
+    /// `get_cinematic_pan_running_wasm()` and
+    /// `viewer-camera-bridge.ts::subscribeToCinematicSweep`.
+    cinematic_active: bool,
     controller: CameraController,
     scene: Option<Scene>,
     scene_file_path: Option<PathBuf>,
@@ -314,6 +330,7 @@ impl WindowContext {
             gamepad_visible: false,
             display,
             force_scene_redraw: false,
+            cinematic_active: false,
             saved_cameras: Vec::new(),
             #[cfg(feature = "video")]
             cameras_save_path: "cameras_saved.json".to_string(),
@@ -352,19 +369,63 @@ impl WindowContext {
         &mut self,
         pc_bytes: Vec<u8>,
         scene_bytes: Option<Vec<u8>>,
+        preserve_camera: bool,
     ) -> anyhow::Result<()> {
         use std::io::Cursor;
         let pc_raw = io::GenericGaussianPointCloud::load(Cursor::new(pc_bytes))?;
-        let (new_camera, centroid, world_up, scene_analysis) =
-            auto_frame_from_raw(&pc_raw, self.config.width, self.config.height, CameraHint::Auto);
+        let scene_analysis = scene_analysis_for_raw(&pc_raw);
+        let (frame_camera, centroid, world_up, _) = auto_frame_from_raw(
+            &pc_raw,
+            self.config.width,
+            self.config.height,
+            CameraHint::Auto,
+        );
         self.scene_analysis = scene_analysis;
         self.pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
-        self.splatting_args.camera = new_camera;
-        // Mirror exactly what WindowContext::new does — just set center, no reset_to_camera.
-        // Calling reset_to_camera with identity rotation corrupts the controller center
-        // (projects it along +Z instead of toward the PC center) causing wrong camera orientation.
         self.controller.center = centroid;
-        self.controller.up = Some(world_up);
+        if preserve_camera {
+            // Bake applies world2view — use the orbit-up vector embedded in
+            // the tuned PLY (captured on source, rotated by the bake matrix)
+            // so horizontal drag matches source navigation. Fall back to +Y
+            // when JS did not pre-install a vector.
+            let pca_up = robust_scene_up(&self.pc);
+            let baked_up = PENDING_SET_ORBIT_UP.with(|cell| cell.borrow_mut().take());
+            self.controller.up = Some(baked_up.unwrap_or_else(Vector3::unit_y));
+            if let Some(pivot) = PENDING_SET_ORBIT_PIVOT.with(|cell| cell.borrow_mut().take())
+            {
+                self.controller.center = pivot;
+            }
+            let mut cam = self.splatting_args.camera.clone();
+            cam.position = Point3::origin();
+            cam.rotation = Quaternion::new(1., 0., 0., 0.);
+            self.splatting_args.camera = cam;
+            // Source tab cancels the intro cinematic on first orbit input, which
+            // calls `reset_to_camera` and projects the pivot onto the view ray.
+            // Tuned embed loads skip cinematic — without this projection the
+            // pivot stays at the raw 3D centroid while the camera is at the
+            // embed origin, so horizontal drag feels like swinging around a
+            // point off to the side instead of orbiting the shot.
+            let pivot_raw = self.controller.center;
+            self.controller.reset_to_camera(self.splatting_args.camera);
+            log::info!(
+                "[web-splat] preserve_camera reload: pivot_raw=({:.4},{:.4},{:.4}) \
+                 pivot_projected=({:.4},{:.4},{:.4}) orbit_radius={:.4} \
+                 pca_up=({:.4},{:.4},{:.4}) controller.up=+Y",
+                pivot_raw.x,
+                pivot_raw.y,
+                pivot_raw.z,
+                self.controller.center.x,
+                self.controller.center.y,
+                self.controller.center.z,
+                (self.splatting_args.camera.position - self.controller.center).magnitude(),
+                pca_up.x,
+                pca_up.y,
+                pca_up.z,
+            );
+        } else {
+            self.controller.up = Some(world_up);
+            self.splatting_args.camera = frame_camera;
+        }
         // Update the JS-readable bounds cache.
         SCENE_BOUNDS.with(|cell| {
             *cell.borrow_mut() = Some(self.pc.scene_bounds());
@@ -378,20 +439,35 @@ impl WindowContext {
         self.splatting_args.walltime = Duration::ZERO;
 
         if let Some(scene_bytes) = scene_bytes {
-            match Scene::from_json(Cursor::new(scene_bytes)) {
-                Ok(scene) => {
-                    self.set_scene(scene);
-                    self.set_scene_camera(0);
-                }
-                Err(e) => log::warn!("could not load scene on reload: {:?}", e),
+            if let Err(e) = self.reload_scene_only(scene_bytes) {
+                log::warn!("could not load scene on reload: {:?}", e);
             }
         }
 
-        // Auto-start the cinematic intro pan so the scene feels alive on first load.
-        // 18.75-second period, ±18° horizontal sweep.
-        // Stops immediately when the user clicks, touches, scrolls, or presses a key.
-        self.start_cinematic_pan(18.75, 18.0);
+        // Intro pan only when there is no cameras.json tour path (auto-walk is started from JS).
+        // Skip when preserving camera — admin PLY-tuner tuned preview must hold the embed.
+        if self.scene.is_none() && !preserve_camera {
+            self.start_cinematic_pan(18.75, 18.0);
+        }
 
+        Ok(())
+    }
+
+    /// Attach or replace cameras.json for auto-walk without reframing the splat view.
+    #[cfg(target_arch = "wasm32")]
+    fn reload_scene_only(&mut self, scene_bytes: Vec<u8>) -> anyhow::Result<()> {
+        use std::io::Cursor;
+        let scene = Scene::from_json(Cursor::new(scene_bytes))?;
+        self.splatting_args.scene_extend = Some(scene.extend());
+        self.scene.replace(scene);
+        self.saved_cameras = self
+            .scene
+            .as_ref()
+            .unwrap()
+            .cameras(Some(Split::Test))
+            .clone();
+        self.current_view = None;
+        self.animation = None;
         Ok(())
     }
 
@@ -436,6 +512,11 @@ impl WindowContext {
         #[cfg(target_arch = "wasm32")]
         let dt = dt.min(Duration::from_millis(250));
 
+        #[cfg(target_arch = "wasm32")]
+        if take_pending_viewer_chrome_toggle() {
+            self.toggle_viewer_chrome();
+        }
+
         if self.splatting_args.walltime < Duration::from_secs(5) {
             self.splatting_args.walltime += dt;
         }
@@ -452,6 +533,10 @@ impl WindowContext {
                 if next_camera.done() {
                     self.animation.take();
                     self.controller.reset_to_camera(self.splatting_args.camera);
+                    // Non-looping animation finished naturally — clear the
+                    // cinematic flag too (defensive; the cinematic itself
+                    // loops and never reaches this branch).
+                    self.set_cinematic_active(false);
                 }
             }
         } else {
@@ -504,6 +589,15 @@ impl WindowContext {
     }
 
     /// Orbit the camera 90° clockwise around the scene up axis (gamepad + WASM).
+    ///
+    /// Instead of snapping the camera instantly, this builds the post-
+    /// rotation target pose and pushes it through the same animation
+    /// pipeline used by `set_camera()` — a `Transition<PerspectiveCamera>`
+    /// driven by `smoothstep` (eased start + end). The animation lasts
+    /// `SNAP_ROTATE_DURATION_MS` so each tap on the React/egui "snap 90°"
+    /// button glides the view rather than teleporting it. Four consecutive
+    /// taps still trace exactly 360° because position is slerp-ed with the
+    /// rotation, leaving the orbit radius stable between snaps.
     pub(crate) fn apply_rotate_view_90_clockwise(&mut self) {
         let world_up = robust_scene_up(&self.pc);
         let center = self.controller.center;
@@ -513,14 +607,39 @@ impl WindowContext {
         let new_offset = rot90.rotate_vector(cam_offset);
         let new_pos = center + new_offset;
         let new_look_dir = (center - new_pos).normalize();
-        self.splatting_args.camera.position = new_pos;
-        self.splatting_args.camera.rotation = Quaternion::look_at(new_look_dir, world_up);
-        self.splatting_args
-            .camera
-            .fit_near_far(&clip_aabb_from_scene_analysis(&self.scene_analysis));
+
+        // Build the target pose. We clone the live camera so projection /
+        // znear / zfar carry over; only position + rotation are rotated.
+        let mut target = self.splatting_args.camera.clone();
+        target.position = new_pos;
+        target.rotation = Quaternion::look_at(new_look_dir, world_up);
+        target.fit_near_far(&clip_aabb_from_scene_analysis(&self.scene_analysis));
+
+        // Lock the world-up the controller orbits around BEFORE the
+        // animation starts so the post-animation `reset_to_camera` keeps
+        // the same up axis (otherwise PCA noise can flip the orbit pivot).
         self.controller.up = Some(world_up);
-        self.animation = None;
+
+        // Clear any controller-side "user just typed" flag so the
+        // animation we are about to install isn't cancelled on the very
+        // next frame by the cancel-on-input branch in `update()`.
+        self.controller.user_inptut = false;
+
+        // `set_camera()` installs an `Animation<PerspectiveCamera>` using
+        // `Transition` + `smoothstep`. The existing `update()` loop drives
+        // it inside `state.update(dt)` — which runs after `old_settings`
+        // is captured — so the render gate detects the change naturally
+        // (no `force_scene_redraw` workaround needed for the animated
+        // path).
+        self.set_camera(target, Duration::from_millis(SNAP_ROTATE_DURATION_MS));
         self.window.request_redraw();
+    }
+
+    /// Toggle on-screen gamepad + notify JS measure chrome (V key).
+    pub(crate) fn toggle_viewer_chrome(&mut self) {
+        self.gamepad_visible = !self.gamepad_visible;
+        #[cfg(target_arch = "wasm32")]
+        set_viewer_chrome_for_js(self.gamepad_visible);
     }
 
     fn render(
@@ -632,6 +751,19 @@ impl WindowContext {
 
         output.present();
         self.splatting_args.viewport = Vector2::new(self.config.width, self.config.height);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            snapshot_camera_for_measure(
+                &self.splatting_args.camera,
+                self.config.width,
+                self.config.height,
+            );
+            snapshot_orbit_axes_for_js(self);
+            snapshot_tour_status(self);
+            dispatch_splat_frame_event();
+        }
+
         Ok(())
     }
 
@@ -656,16 +788,44 @@ impl WindowContext {
         }
     }
 
-    fn start_tracking_shot(&mut self) {
-        if self.saved_cameras.len() > 1 {
-            let shot = TrackingShot::from_cameras(self.saved_cameras.clone());
-            let a: Animation<PerspectiveCamera> = Animation::new(
-                Duration::from_secs_f32(self.saved_cameras.len() as f32 * 4.),
-                true,
-                Box::new(shot),
-            );
-            self.animation = Some((a, true));
+    /// Update the cinematic-active mirror and notify JS if the value
+    /// transitioned. Cheap to call from every animation-starting / clearing
+    /// site even when nothing changes — the JS helper deduplicates.
+    fn set_cinematic_active(&mut self, active: bool) {
+        if self.cinematic_active == active {
+            return;
         }
+        self.cinematic_active = active;
+        #[cfg(target_arch = "wasm32")]
+        set_cinematic_active_for_js(active);
+    }
+
+    fn start_tracking_shot(&mut self) {
+        self.start_tracking_shot_with_duration(None, 1.0);
+    }
+
+    /// Catmull-Rom spline through `saved_cameras`. `duration_secs` overrides the default
+    /// (`len * 4` seconds per loop); `duration_scale` multiplies that default when `duration_secs` is None.
+    fn start_tracking_shot_with_duration(
+        &mut self,
+        duration_secs: Option<f32>,
+        duration_scale: f32,
+    ) {
+        if self.saved_cameras.len() <= 1 {
+            return;
+        }
+        self.controller.user_inptut = false;
+        let shot = TrackingShot::from_cameras(self.saved_cameras.clone());
+        let default_secs = self.saved_cameras.len() as f32 * 4.0;
+        let total_secs = duration_secs.unwrap_or(default_secs * duration_scale.max(0.1));
+        let a: Animation<PerspectiveCamera> = Animation::new(
+            Duration::from_secs_f32(total_secs),
+            true,
+            Box::new(shot),
+        );
+        self.animation = Some((a, true));
+        // A different animation just superseded any cinematic sweep.
+        self.set_cinematic_active(false);
     }
 
     /// Starts the cinematic intro animation — a smooth sine-wave pan around
@@ -696,11 +856,17 @@ impl WindowContext {
             Box::new(sampler),
         );
         self.animation = Some((anim, true));
+        // We are now the active animation — sync JS so the play/pause
+        // icon flips to "Pause" without waiting for a user click.
+        self.set_cinematic_active(true);
     }
 
     fn cancle_animation(&mut self) {
         self.animation.take();
         self.controller.reset_to_camera(self.splatting_args.camera);
+        // Whatever animation was running (including the cinematic auto-sweep)
+        // is gone — make sure the React icon reflects "not playing".
+        self.set_cinematic_active(false);
     }
 
     fn stop_animation(&mut self) {
@@ -708,6 +874,7 @@ impl WindowContext {
             *playing = false;
         }
         self.controller.reset_to_camera(self.splatting_args.camera);
+        self.set_cinematic_active(false);
     }
 
     fn set_scene_camera(&mut self, i: usize) {
@@ -742,6 +909,8 @@ impl WindowContext {
                 )),
             );
             self.animation = Some((a, true));
+            // Camera-snap animation supersedes any cinematic sweep.
+            self.set_cinematic_active(false);
         }
     }
 
@@ -1115,9 +1284,10 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
 
     let mut last = Instant::now();
 
-    // Auto-start the cinematic intro pan so the scene feels alive on first load.
-    // Stops immediately the moment the user clicks, touches, scrolls, or presses a key.
-    state.start_cinematic_pan(18.75, 18.0);
+    // Intro pan only without a cameras.json scene; cinematic auto-walk uses start_tracking_shot_wasm.
+    if state.scene.is_none() {
+        state.start_cinematic_pan(18.75, 18.0);
+    }
 
     #[allow(deprecated)]
     event_loop.run(move |event,target| {
@@ -1132,9 +1302,20 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
         // We must NOT create a new EventLoop for re-renders — instead we swap the point cloud here.
         #[cfg(target_arch = "wasm32")]
         if let Event::NewEvents(_) = &event {
+            let pending_scene = PENDING_SCENE_RELOAD.with(|cell| cell.borrow_mut().take());
+            if let Some(scene_bytes) = pending_scene {
+                match state.reload_scene_only(scene_bytes) {
+                    Ok(()) => log::info!("scene hot-reloaded (view camera preserved)"),
+                    Err(e) => log::error!("scene hot-reload failed: {:?}", e),
+                }
+            }
+
             let pending = PENDING_RELOAD.with(|cell| cell.borrow_mut().take());
             if let Some((pc_bytes, scene_bytes)) = pending {
-                match state.reload_from_bytes(pc_bytes, scene_bytes) {
+                let preserve_camera = PENDING_RELOAD_PRESERVE_CAMERA.with(|cell| {
+                    std::mem::replace(&mut *cell.borrow_mut(), false)
+                });
+                match state.reload_from_bytes(pc_bytes, scene_bytes, preserve_camera) {
                     Ok(()) => {
                         log::info!("point cloud hot-reloaded successfully");
                         // Hide the "Unpacking" spinner now that reload is complete
@@ -1152,18 +1333,156 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
             }
 
             // Check if JS or gamepad called auto_center_camera() / return_to_origin() to reset the view.
+            //
+            // We force a render via `force_scene_redraw` because these snap
+            // actions mutate `splatting_args.camera` directly, BEFORE the
+            // RedrawRequested handler captures `old_settings`. By the time
+            // the render gate compares old vs. new settings, both already
+            // hold the snapped camera, so the inequality check would say
+            // "nothing changed" and skip the render — leaving the user
+            // staring at the stale pre-snap frame.
             let needs_center = PENDING_AUTO_CENTER.with(|cell| {
                 std::mem::replace(&mut *cell.borrow_mut(), false)
             }) || PENDING_RETURN_TO_ORIGIN.with(|cell| {
                 std::mem::replace(&mut *cell.borrow_mut(), false)
             });
             if needs_center {
+                log::info!("[wasm] auto-center / return-to-origin drained");
                 state.apply_auto_frame_scene();
+                state.force_scene_redraw = true;
+                state.controller.user_inptut = true;
+                state.window.request_redraw();
             }
 
             // Check if JS called rotate_view_90_wasm() — orbit 90° around world_up.
+            //
+            // `apply_rotate_view_90_clockwise` now installs an
+            // `Animation<PerspectiveCamera>` (smoothstep, ~450ms) instead
+            // of mutating `splatting_args.camera` in-place. The animation
+            // is sampled inside `state.update(dt)` — which runs after
+            // `old_settings` is captured by the render gate — so the
+            // gate's `old_settings != state.splatting_args` check fires
+            // every frame the animation is running. We deliberately
+            // DON'T set `controller.user_inptut = true` here: that flag
+            // is the cancel-on-input signal for the animation branch in
+            // `update()`, so toggling it on would cancel the snap before
+            // the first sampled frame is ever drawn.
             if PENDING_ROTATE_90.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), false)) {
+                log::info!("[wasm] snap-90 drained — starting eased rotate animation");
                 state.apply_rotate_view_90_clockwise();
+                state.window.request_redraw();
+            }
+
+            if PENDING_CLEAR_ORBIT_UP.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), false))
+            {
+                state.controller.up = None;
+            }
+
+            if PENDING_RESET_ORBIT_TO_CAMERA
+                .with(|cell| std::mem::replace(&mut *cell.borrow_mut(), false))
+            {
+                state.controller.reset_to_camera(state.splatting_args.camera);
+            }
+
+            if let Some(up) =
+                PENDING_SET_ORBIT_UP.with(|cell| cell.borrow_mut().take())
+            {
+                state.controller.up = Some(up);
+            }
+
+            if let Some(pivot) =
+                PENDING_SET_ORBIT_PIVOT.with(|cell| cell.borrow_mut().take())
+            {
+                state.controller.center = pivot;
+            }
+
+            // JS-driven exact-camera install (Scene Tuner "Apply view",
+            // pose persistence, "Capture & restore"). Animates via the
+            // same Transition<PerspectiveCamera> pipeline as set_scene_camera
+            // when animate_ms > 0; snaps otherwise. Cancels any running
+            // animation (cinematic sweep, tour) — same semantics as
+            // `set_scene_camera` because we go through `set_camera()`.
+            if let Some([px, py, pz, qw, qx, qy, qz, fov_y, animate_ms]) =
+                PENDING_SET_CAMERA.with(|cell| cell.borrow_mut().take())
+            {
+                let mut target = state.splatting_args.camera.clone();
+                target.position = Point3::new(px, py, pz);
+                target.rotation = Quaternion::new(qw, qx, qy, qz);
+                if fov_y > 0.0 {
+                    let prev_fov_y = target.projection.fovy.0;
+                    if prev_fov_y > 1e-6 {
+                        // Preserve aspect: fovx scales with the same ratio as fovy.
+                        let scale = fov_y / prev_fov_y;
+                        target.projection.fovy = cgmath::Rad(fov_y);
+                        target.projection.fovx = cgmath::Rad(target.projection.fovx.0 * scale);
+                    }
+                }
+                let dur = Duration::from_millis(animate_ms as u64);
+                state.set_camera(target, dur);
+                state.force_scene_redraw = true;
+                state.controller.user_inptut = true;
+                state.window.request_redraw();
+            }
+
+            // Mirror the React virtual-gamepad onto the controller using
+            // edge-triggered dispatch: only overwrite a controller flag when
+            // the React snapshot transitions vs. the last frame.
+            //
+            // This avoids two failure modes the original implementation hit:
+            //   * OR'ing every frame — a release would never clear because
+            //     `existing_true || new_false == true`. (Symptom: "Move
+            //     camera doesn't stop after I let go.")
+            //   * Always overwriting — clobbers the keyboard's flag every
+            //     frame, so OS WASD input gets reset to false repeatedly.
+            //
+            // Edge dispatch lets each input source own its own transitions:
+            // press → flag goes true once, release → flag goes false once,
+            // and frames where React is idle leave the controller alone.
+            let movement = PENDING_MOVEMENT_KEYS.with(|cell| *cell.borrow());
+            let prev = LAST_APPLIED_JS_MOVEMENT.with(|cell| *cell.borrow());
+            if movement != prev {
+                if movement[0] != prev[0] { state.controller.move_forward  = movement[0]; }
+                if movement[1] != prev[1] { state.controller.move_backward = movement[1]; }
+                if movement[2] != prev[2] { state.controller.move_left     = movement[2]; }
+                if movement[3] != prev[3] { state.controller.move_right    = movement[3]; }
+                if movement[4] != prev[4] { state.controller.move_up       = movement[4]; }
+                if movement[5] != prev[5] { state.controller.move_down     = movement[5]; }
+                if movement[6] != prev[6] { state.controller.roll_left     = movement[6]; }
+                if movement[7] != prev[7] { state.controller.roll_right    = movement[7]; }
+                LAST_APPLIED_JS_MOVEMENT.with(|cell| *cell.borrow_mut() = movement);
+                state.controller.user_inptut = true;
+                state.window.request_redraw();
+            }
+
+            // Drain rotation / pan / zoom accumulators into the controller —
+            // the controller decays them naturally each frame, matching how
+            // the egui d-pad fed them when the panel was rendered in-WASM.
+            let (yaw, pitch) = PENDING_ROTATION_IMPULSE.with(|cell| {
+                std::mem::replace(&mut *cell.borrow_mut(), (0.0, 0.0))
+            });
+            if yaw != 0.0 || pitch != 0.0 {
+                state.controller.rotation.x += yaw;
+                state.controller.rotation.y += pitch;
+                state.controller.user_inptut = true;
+                state.window.request_redraw();
+            }
+
+            let (pan_x, pan_y) = PENDING_PAN_IMPULSE.with(|cell| {
+                std::mem::replace(&mut *cell.borrow_mut(), (0.0, 0.0))
+            });
+            if pan_x != 0.0 || pan_y != 0.0 {
+                state.controller.shift.x += pan_x;
+                state.controller.shift.y += pan_y;
+                state.controller.user_inptut = true;
+                state.window.request_redraw();
+            }
+
+            let zoom_dy = PENDING_ZOOM_IMPULSE.with(|cell| {
+                std::mem::replace(&mut *cell.borrow_mut(), 0.0)
+            });
+            if zoom_dy != 0.0 {
+                state.controller.process_scroll(zoom_dy);
+                state.window.request_redraw();
             }
 
             // Check if JS called start_cinematic_pan_wasm() or stop_cinematic_pan_wasm().
@@ -1173,6 +1492,16 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 } else {
                     state.cancle_animation();
                 }
+                state.window.request_redraw();
+            }
+
+            if PENDING_TOUR_STOP.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), false)) {
+                state.cancle_animation();
+                state.window.request_redraw();
+            }
+
+            if let Some(scale) = PENDING_TRACKING_SHOT.with(|cell| cell.borrow_mut().take()) {
+                state.start_tracking_shot_with_duration(None, scale);
                 state.window.request_redraw();
             }
 
@@ -1220,8 +1549,8 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                         }
                     }else if key == KeyCode::KeyU{
                         state.ui_visible = !state.ui_visible;
-                    }else if key == KeyCode::KeyV{
-                        state.gamepad_visible = !state.gamepad_visible;
+                        #[cfg(target_arch = "wasm32")]
+                        set_ui_visible_for_js(state.ui_visible);
                     }else if key == KeyCode::KeyC{
                         state.save_view();
                     } else  if key == KeyCode::KeyR && state.controller.alt_pressed{
@@ -1252,12 +1581,14 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                         }
                     }
                 }
-                state
-                    .controller
-                    .process_keyboard(key, event.state == ElementState::Pressed);
+                if !measure_picking_active() {
+                    state
+                        .controller
+                        .process_keyboard(key, event.state == ElementState::Pressed);
+                }
             }
             }
-            WindowEvent::MouseWheel { delta, .. } => match delta {
+            WindowEvent::MouseWheel { delta, .. } if !measure_picking_active() => match delta {
                 winit::event::MouseScrollDelta::LineDelta(_, dy) => {
                     state.controller.process_scroll(*dy )
                 }
@@ -1265,14 +1596,14 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                     state.controller.process_scroll(p.y as f32 / 100.)
                 }
             },
-            WindowEvent::MouseInput { state:button_state, button, .. }=>{
+            WindowEvent::MouseInput { state:button_state, button, .. } if !measure_picking_active() => {
                 match button {
                     winit::event::MouseButton::Left =>                         state.controller.left_mouse_pressed = *button_state == ElementState::Pressed,
                     winit::event::MouseButton::Right => state.controller.right_mouse_pressed = *button_state == ElementState::Pressed,
                     _=>{}
                 }
             }
-            WindowEvent::Touch(touch) => {
+            WindowEvent::Touch(touch) if !measure_picking_active() => {
                 let touch_phase = match touch.phase {
                     WinitTouchPhase::Started => controller::TouchPhase::Started,
                     WinitTouchPhase::Moved => controller::TouchPhase::Moved,
@@ -1326,7 +1657,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
         Event::DeviceEvent {
             event: DeviceEvent::MouseMotion{ delta, },
             .. // We're not using device_id currently
-        } => {
+        } if !measure_picking_active() => {
             state.controller.process_mouse(delta.0 as f32, delta.1 as f32)
         }
         _ => {}
@@ -1343,6 +1674,13 @@ static RENDER_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static PENDING_RELOAD: std::cell::RefCell<Option<(Vec<u8>, Option<Vec<u8>>)>> =
+        std::cell::RefCell::new(None);
+    /// When true, the next `reload_pc_wasm` keeps the live camera (PLY-tuner
+    /// tuned preview with `vb:initial_camera_*` embed).
+    static PENDING_RELOAD_PRESERVE_CAMERA: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+    /// cameras.json only — keeps the current auto-framed view camera and orbit pivot.
+    static PENDING_SCENE_RELOAD: std::cell::RefCell<Option<Vec<u8>>> =
         std::cell::RefCell::new(None);
 }
 
@@ -1362,6 +1700,25 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+/// Duration scale for the next `start_tracking_shot_wasm` (default 1.0).
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_TRACKING_SHOT: std::cell::RefCell<Option<f32>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_TOUR_STOP: std::cell::RefCell<bool> = std::cell::RefCell::new(false);
+}
+
+/// Latest tour status for JS: `[playing, cameraCount, hasScene, canPlay]`.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static TOUR_STATUS_SNAPSHOT: std::cell::RefCell<Option<Vec<f32>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Signal from gamepad or JS to return camera to origin (initial auto-framed position).
 #[cfg(target_arch = "wasm32")]
 thread_local! {
@@ -1377,6 +1734,56 @@ thread_local! {
         std::cell::RefCell::new(false);
 }
 
+/// Held FPS-movement flags from a JS-side virtual gamepad. Mirrors the
+/// `CameraController::move_*` / `roll_*` booleans 1-to-1 — the running event
+/// loop overwrites the controller state from this snapshot every frame so a
+/// React button can hold a key as long as the pointer is down.
+///
+/// Layout: `[forward, backward, left, right, up, down, roll_left, roll_right]`.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_MOVEMENT_KEYS: std::cell::RefCell<[bool; 8]> =
+        std::cell::RefCell::new([false; 8]);
+}
+
+/// Snapshot of the JS movement flags as they were the last time the running
+/// event loop applied them to the controller. Used for edge-triggered
+/// dispatch: we only overwrite a controller boolean when the React snapshot
+/// transitions, so OS-level keyboard input keeps owning the flag while React
+/// is idle (and vice-versa). Without this, a momentary React press would
+/// either get lost (if we always overwrote) or get stuck on (if we OR'd) —
+/// the latter was the original "Move camera doesn't release" bug.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static LAST_APPLIED_JS_MOVEMENT: std::cell::RefCell<[bool; 8]> =
+        std::cell::RefCell::new([false; 8]);
+}
+
+/// Accumulator for orbit-rotation impulses from JS (yaw, pitch). Drained
+/// each frame and added to `controller.rotation` exactly like the gamepad
+/// rotate-d-pad does internally. Decays naturally via the controller.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_ROTATION_IMPULSE: std::cell::RefCell<(f32, f32)> =
+        std::cell::RefCell::new((0.0, 0.0));
+}
+
+/// Accumulator for orbit-pivot pan impulses from JS (shift_x, shift_y).
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_PAN_IMPULSE: std::cell::RefCell<(f32, f32)> =
+        std::cell::RefCell::new((0.0, 0.0));
+}
+
+/// Accumulator for zoom-scroll impulses from JS. Positive = zoom in, negative
+/// = zoom out (matches the gamepad zoom buttons, which forward to
+/// `process_scroll`).
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_ZOOM_IMPULSE: std::cell::RefCell<f32> =
+        std::cell::RefCell::new(0.0);
+}
+
 /// Caches [cx, cy, cz, radius] for the currently loaded point cloud so that
 /// `get_scene_bounds()` can return them synchronously from JS.
 #[cfg(target_arch = "wasm32")]
@@ -1385,13 +1792,120 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+/// Snapshot of the live perspective camera, refreshed every frame.
+///
+/// Layout (11 floats):
+/// `[px, py, pz, qw, qx, qy, qz, fov_y_rad, fov_x_rad, znear, zfar]`.
+///
+/// JS reads this via `get_perspective_camera_wasm()` to recover the human-
+/// meaningful camera state (Scene Tuner "Capture current view" button,
+/// pose persistence, etc.). The matrices in `CAMERA_SNAPSHOT` are kept for
+/// raycasting; this one is purely the underlying perspective parameters
+/// before any viewport-Y flip / projection bake.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PERSPECTIVE_CAMERA_SNAPSHOT: std::cell::RefCell<Option<[f32; 11]>> =
+        std::cell::RefCell::new(None);
+    /// Orbit-controller axes for JS diagnostics (`get_orbit_axis_debug_wasm`).
+    static ORBIT_AXIS_SNAPSHOT: std::cell::RefCell<Option<Vec<f32>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Pending JS request to install a specific perspective camera.
+///
+/// Layout: `[px, py, pz, qw, qx, qy, qz, fov_y_rad, animate_ms]`. A value
+/// of `0.0` for `animate_ms` snaps; anything > 0 hands off to the smoothstep
+/// `Animation<PerspectiveCamera>` pipeline used by `WindowContext::set_camera`.
+/// `fov_y_rad <= 0.0` keeps the current fov.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_SET_CAMERA: std::cell::RefCell<Option<[f32; 9]>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Called from JS when the user uploads a new file while a render is already active.
 /// Stores the new data so the running event loop can swap the point cloud in-place.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn reload_pc_wasm(pc: Vec<u8>, scene: Option<Vec<u8>>) {
+    PENDING_RELOAD_PRESERVE_CAMERA.with(|cell| *cell.borrow_mut() = false);
     PENDING_RELOAD.with(|cell| {
         *cell.borrow_mut() = Some((pc, scene));
+    });
+}
+
+/// Hot-swap the point cloud but keep the live camera. Used when the incoming PLY
+/// carries a `vb:initial_camera_*` embed and JS will snap to that pose after load.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn reload_pc_wasm_preserve_camera(pc: Vec<u8>, scene: Option<Vec<u8>>) {
+    PENDING_RELOAD_PRESERVE_CAMERA.with(|cell| *cell.borrow_mut() = true);
+    PENDING_RELOAD.with(|cell| {
+        *cell.borrow_mut() = Some((pc, scene));
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_CLEAR_ORBIT_UP: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+    static PENDING_RESET_ORBIT_TO_CAMERA: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+    static PENDING_SET_ORBIT_UP: std::cell::RefCell<Option<Vector3<f32>>> =
+        std::cell::RefCell::new(None);
+    static PENDING_SET_ORBIT_PIVOT: std::cell::RefCell<Option<Point3<f32>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Drop the orbit controller's locked world-up vector so yaw/pan/gamepad use
+/// camera-relative axes. Call after a `vb:initial_camera_*` snap settles on
+/// baked PLYs — their floor is view-aligned, not global +Y.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn clear_orbit_world_up_wasm() {
+    PENDING_CLEAR_ORBIT_UP.with(|cell| *cell.borrow_mut() = true);
+}
+
+/// Project the orbit pivot onto the current camera view ray and align the
+/// locked world-up vector to the camera plane — same as cancelling the intro
+/// cinematic on the source tab. Call after a `vb:initial_camera_*` embed snap
+/// settles so tuned PLY orbit matches source navigation.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn reset_orbit_to_camera_wasm() {
+    PENDING_RESET_ORBIT_TO_CAMERA.with(|cell| *cell.borrow_mut() = true);
+}
+
+/// Lock horizontal orbit to a world-space up direction (need not be unit).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn set_orbit_world_up_wasm(x: f32, y: f32, z: f32) {
+    let v = Vector3::new(x, y, z);
+    let n = v.magnitude();
+    if n < 1e-6 || !n.is_finite() {
+        return;
+    }
+    PENDING_SET_ORBIT_UP.with(|cell| *cell.borrow_mut() = Some(v / n));
+}
+
+/// Install the orbit pivot (world-space point the camera swings around).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn set_orbit_pivot_wasm(x: f32, y: f32, z: f32) {
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return;
+    }
+    PENDING_SET_ORBIT_PIVOT.with(|cell| {
+        *cell.borrow_mut() = Some(Point3::new(x, y, z));
+    });
+}
+
+/// Hot-swap cameras.json for auto-walk without reloading the splat or moving the view.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn reload_scene_wasm(scene: Vec<u8>) {
+    PENDING_SCENE_RELOAD.with(|cell| {
+        *cell.borrow_mut() = Some(scene);
     });
 }
 
@@ -1443,6 +1957,88 @@ pub fn rotate_view_90_wasm() {
     });
 }
 
+/// Set the held FPS-movement key flags from a React/HTML virtual gamepad.
+///
+/// Each boolean maps 1-to-1 to a `CameraController` field — set them all to
+/// `false` when the pointer leaves the button or comes up. The running event
+/// loop overwrites the controller booleans from this snapshot every frame so
+/// holding a button keeps the camera moving for as long as the press lasts.
+///
+/// * `forward` / `backward` → W / S (translate along floor-projected view forward)
+/// * `left` / `right`       → A / D (strafe along floor-projected view right)
+/// * `up` / `down`          → E / Q (altitude — translate along locked scene up)
+/// * `roll_left` / `roll_right` → Z / X (tilt — roll around the view forward)
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn set_movement_keys_wasm(
+    forward: bool,
+    backward: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    roll_left: bool,
+    roll_right: bool,
+) {
+    PENDING_MOVEMENT_KEYS.with(|cell| {
+        *cell.borrow_mut() = [
+            forward, backward, left, right, up, down, roll_left, roll_right,
+        ];
+    });
+}
+
+/// Convenience wrapper to clear every movement key (useful on `pointerleave`,
+/// `blur`, or when the React panel unmounts).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn clear_movement_keys_wasm() {
+    PENDING_MOVEMENT_KEYS.with(|cell| *cell.borrow_mut() = [false; 8]);
+}
+
+/// Add to the orbit-rotation impulse accumulator (yaw, pitch). Mirrors the
+/// arrow-key impulse the egui gamepad rotate-d-pad applied — call it on each
+/// rAF while the React rotate button is held. The controller decays the
+/// impulse naturally between frames so the motion stays smooth.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn apply_rotation_impulse_wasm(yaw: f32, pitch: f32) {
+    if !yaw.is_finite() || !pitch.is_finite() {
+        return;
+    }
+    PENDING_ROTATION_IMPULSE.with(|cell| {
+        let mut v = cell.borrow_mut();
+        v.0 += yaw;
+        v.1 += pitch;
+    });
+}
+
+/// Add to the orbit-pivot pan impulse accumulator (shift_x, shift_y).
+/// Equivalent to the `I/J/K/L` keys.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn apply_pan_impulse_wasm(shift_x: f32, shift_y: f32) {
+    if !shift_x.is_finite() || !shift_y.is_finite() {
+        return;
+    }
+    PENDING_PAN_IMPULSE.with(|cell| {
+        let mut v = cell.borrow_mut();
+        v.0 += shift_x;
+        v.1 += shift_y;
+    });
+}
+
+/// Add to the zoom-scroll impulse accumulator. Positive zooms in, negative
+/// zooms out (matches the gamepad zoom buttons, which call
+/// `controller.process_scroll` with ±3.0 while held).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn apply_zoom_wasm(delta: f32) {
+    if !delta.is_finite() {
+        return;
+    }
+    PENDING_ZOOM_IMPULSE.with(|cell| *cell.borrow_mut() += delta);
+}
+
 /// Starts the cinematic intro pan from JavaScript.
 ///
 /// The camera smoothly oscillates left-to-right around the scene centroid with
@@ -1471,12 +2067,388 @@ pub fn stop_cinematic_pan_wasm() {
     });
 }
 
+/// Start a looping cinematic tour along imported scene cameras (TrackingShot spline).
+/// Uses test-split cameras loaded from `cameras.json`. Cancels on user input.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn start_tracking_shot_wasm() {
+    start_tracking_shot_wasm_with_duration_scale(1.0);
+}
+
+/// Same as `start_tracking_shot_wasm` with duration multiplier (0.5 = faster, 2.0 = slower).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn start_tracking_shot_wasm_with_duration_scale(duration_scale: f32) {
+    PENDING_TRACKING_SHOT.with(|cell| {
+        *cell.borrow_mut() = Some(duration_scale);
+    });
+}
+
+/// Stop the camera tour and return control to the user.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn stop_tour_wasm() {
+    PENDING_TOUR_STOP.with(|cell| *cell.borrow_mut() = true);
+}
+
+/// Tour status snapshot: `[playing, cameraCount, hasScene, canPlay]` or null before first frame.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn get_tour_status_wasm() -> Option<Vec<f32>> {
+    TOUR_STATUS_SNAPSHOT.with(|c| c.borrow().clone())
+}
+
 /// Pending wall tint change from JS.
 /// `Some(Some([r, g, b, strength]))` → set tint; `Some(None)` → clear tint; `None` → no change.
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static PENDING_WALL_TINT: std::cell::RefCell<Option<Option<[f32; 4]>>> =
         std::cell::RefCell::new(None);
+}
+
+/// Mirrors `WindowContext::ui_visible` (U key — egui stats/settings only).
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static UI_VISIBLE_JS: std::cell::RefCell<bool> = std::cell::RefCell::new(false);
+}
+
+/// Mirrors `gamepad_visible` for React measure panel (V key — toggled together).
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static VIEWER_CHROME_VISIBLE: std::cell::RefCell<bool> = std::cell::RefCell::new(false);
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_VIEWER_CHROME_TOGGLE: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_ui_visible_for_js(visible: bool) {
+    UI_VISIBLE_JS.with(|c| *c.borrow_mut() = visible);
+    if let Some(window) = web_sys::window() {
+        if let Ok(event) = web_sys::Event::new("vb-ui-visible") {
+            let _ = window.dispatch_event(&event);
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_viewer_chrome_for_js(visible: bool) {
+    VIEWER_CHROME_VISIBLE.with(|c| *c.borrow_mut() = visible);
+    if let Some(window) = web_sys::window() {
+        if let Ok(event) = web_sys::Event::new("vb-viewer-chrome") {
+            let _ = window.dispatch_event(&event);
+        }
+    }
+}
+
+/// Mirrors `WindowContext::cinematic_active` so JS can poll on demand.
+/// Updated through `set_cinematic_active_for_js`, which also dispatches
+/// `vb-cinematic-pan` so React can subscribe instead of polling.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static CINEMATIC_PAN_ACTIVE_JS: std::cell::RefCell<bool> =
+        std::cell::RefCell::new(false);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_cinematic_active_for_js(active: bool) {
+    let changed = CINEMATIC_PAN_ACTIVE_JS.with(|c| {
+        let prev = *c.borrow();
+        if prev == active {
+            return false;
+        }
+        *c.borrow_mut() = active;
+        true
+    });
+    if !changed {
+        return;
+    }
+    if let Some(window) = web_sys::window() {
+        if let Ok(event) = web_sys::Event::new("vb-cinematic-pan") {
+            let _ = window.dispatch_event(&event);
+        }
+    }
+}
+
+/// Returns whether the auto-sweep cinematic pan is currently the active
+/// animation. Cheap getter used by React on viewer mount to initialize the
+/// play/pause icon state correctly (WASM auto-starts the pan when no
+/// cameras.json tour is loaded, so the icon must show "pause", not
+/// "play", on first paint).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn get_cinematic_pan_running_wasm() -> bool {
+    CINEMATIC_PAN_ACTIVE_JS.with(|c| *c.borrow())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn take_pending_viewer_chrome_toggle() -> bool {
+    PENDING_VIEWER_CHROME_TOGGLE.with(|c| {
+        let pending = *c.borrow();
+        if pending {
+            *c.borrow_mut() = false;
+        }
+        pending
+    })
+}
+
+/// When true, orbit / FPS camera input is ignored so JS can place measure points.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static MEASURE_PICKING: std::cell::RefCell<bool> = std::cell::RefCell::new(false);
+}
+
+/// Latest view + projection (column-major 16 + 16 floats) for JS raycasting.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static CAMERA_SNAPSHOT: std::cell::RefCell<Option<Vec<f32>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn measure_picking_active() -> bool {
+    MEASURE_PICKING.with(|c| *c.borrow())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[cfg(target_arch = "wasm32")]
+fn snapshot_tour_status(state: &WindowContext) {
+    let playing = state
+        .animation
+        .as_ref()
+        .map(|(_, playing)| if *playing { 1.0 } else { 0.0 })
+        .unwrap_or(0.0);
+    let camera_count = state.saved_cameras.len() as f32;
+    let has_scene = if state.scene.is_some() { 1.0 } else { 0.0 };
+    let can_play = if state.saved_cameras.len() > 1 { 1.0 } else { 0.0 };
+    TOUR_STATUS_SNAPSHOT.with(|c| {
+        *c.borrow_mut() = Some(vec![playing, camera_count, has_scene, can_play]);
+    });
+}
+
+fn snapshot_camera_for_measure(
+    camera: &PerspectiveCamera,
+    viewport_width: u32,
+    viewport_height: u32,
+) {
+    let view = camera.view_matrix();
+    let proj = VIEWPORT_Y_FLIP * camera.proj_matrix();
+    let view_col: &[f32; 16] = AsRef::<[f32; 16]>::as_ref(&view);
+    let proj_col: &[f32; 16] = AsRef::<[f32; 16]>::as_ref(&proj);
+    let mut buf = Vec::with_capacity(34);
+    buf.extend_from_slice(view_col);
+    buf.extend_from_slice(proj_col);
+    buf.push(viewport_width as f32);
+    buf.push(viewport_height as f32);
+    CAMERA_SNAPSHOT.with(|c| *c.borrow_mut() = Some(buf));
+
+    // Mirror the underlying perspective parameters so JS can recover
+    // position / quaternion / fov without inverting the view matrix.
+    let q = camera.rotation;
+    let snap: [f32; 11] = [
+        camera.position.x,
+        camera.position.y,
+        camera.position.z,
+        q.s,
+        q.v.x,
+        q.v.y,
+        q.v.z,
+        camera.projection.fovy.0,
+        camera.projection.fovx.0,
+        camera.projection.znear,
+        camera.projection.zfar,
+    ];
+    PERSPECTIVE_CAMERA_SNAPSHOT.with(|c| *c.borrow_mut() = Some(snap));
+}
+
+/// Refresh the orbit-axis snapshot read by `get_orbit_axis_debug_wasm`.
+///
+/// Layout (26 floats):
+///   0..3   orbit_pitch_axis  (camera right, mouse vertical orbit)
+///   3..6   orbit_yaw_axis    (horizontal orbit pole)
+///   6..9   look_forward      (camera view direction)
+///  12..15  orbit_pivot
+///  15..18  locked_world_up   (NaN when `controller.up` is None)
+///  18      has_locked_up     (1.0 = locked, 0.0 = camera-relative)
+///  19..22  robust_scene_up   (PCA/AABB floor normal heuristic)
+///  22      orbit_radius      (camera ↔ pivot distance)
+///  23      orbit_yaw_vs_world_y_deg
+///  24      orbit_yaw_vs_scene_up_deg
+///  25      orbit_yaw_vs_camera_down_deg (0 when using camera-relative up)
+#[cfg(target_arch = "wasm32")]
+fn snapshot_orbit_axes_for_js(state: &WindowContext) {
+    use cgmath::{InnerSpace, Matrix3, MetricSpace};
+
+    let camera = &state.splatting_args.camera;
+    let controller = &state.controller;
+    let view_t: Matrix3<f32> = camera.rotation.invert().into();
+    let pitch_axis = view_t.x.normalize();
+    let yaw_axis = controller
+        .up
+        .map(|u| u.normalize())
+        .unwrap_or_else(|| view_t.y.normalize());
+    let camera_back = view_t.z.normalize();
+    let look_forward = (-camera_back).normalize();
+    let robust_up = robust_scene_up(&state.pc).normalize();
+    let world_y = Vector3::unit_y();
+    let center = controller.center;
+    let distance = camera.position.distance(center);
+    let locked = controller
+        .up
+        .map(|u| u.normalize())
+        .unwrap_or(Vector3::new(f32::NAN, f32::NAN, f32::NAN));
+    let has_locked = if controller.up.is_some() { 1.0 } else { 0.0 };
+    let camera_down = view_t.y.normalize();
+
+    let angle_deg = |a: Vector3<f32>, b: Vector3<f32>| -> f32 {
+        a.dot(b).clamp(-1.0, 1.0).acos().to_degrees()
+    };
+
+    let snap = vec![
+        pitch_axis.x,
+        pitch_axis.y,
+        pitch_axis.z,
+        yaw_axis.x,
+        yaw_axis.y,
+        yaw_axis.z,
+        look_forward.x,
+        look_forward.y,
+        look_forward.z,
+        camera_back.x,
+        camera_back.y,
+        camera_back.z,
+        center.x,
+        center.y,
+        center.z,
+        locked.x,
+        locked.y,
+        locked.z,
+        has_locked,
+        robust_up.x,
+        robust_up.y,
+        robust_up.z,
+        distance,
+        angle_deg(yaw_axis, world_y),
+        angle_deg(yaw_axis, robust_up),
+        angle_deg(yaw_axis, camera_down),
+    ];
+    ORBIT_AXIS_SNAPSHOT.with(|c| *c.borrow_mut() = Some(snap));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch_splat_frame_event() {
+    if let Some(window) = web_sys::window() {
+        if let Ok(event) = web_sys::Event::new("vb-splat-frame") {
+            let _ = window.dispatch_event(&event);
+        }
+    }
+}
+
+/// Whether the main egui HUD is visible (toggled with U in the viewer).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn get_ui_visible_wasm() -> bool {
+    UI_VISIBLE_JS.with(|c| *c.borrow())
+}
+
+/// Whether gamepad + JS measure chrome are visible (V key).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn get_viewer_chrome_visible_wasm() -> bool {
+    VIEWER_CHROME_VISIBLE.with(|c| *c.borrow())
+}
+
+/// Toggle gamepad and JS measure chrome together (same as V in the viewer).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn toggle_viewer_chrome_wasm() {
+    PENDING_VIEWER_CHROME_TOGGLE.with(|c| *c.borrow_mut() = true);
+}
+
+/// Enable/disable measure picking from JS (blocks orbit input only while placing points).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn set_measure_mode_wasm(enabled: bool) {
+    MEASURE_PICKING.with(|c| *c.borrow_mut() = enabled);
+}
+
+/// Returns camera data for the JS measure overlay, or null before the first frame.
+///
+/// Layout: view[16] + projection[16] (column-major, projection includes VIEWPORT_Y_FLIP)
+/// + viewport width + height (physical pixels).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn get_camera_matrices_wasm() -> Option<Vec<f32>> {
+    CAMERA_SNAPSHOT.with(|c| c.borrow().clone())
+}
+
+/// Snapshot of the live perspective camera (Scene Tuner / pose persistence).
+///
+/// Returns an 11-element `Float32Array`:
+/// `[px, py, pz, qw, qx, qy, qz, fov_y_rad, fov_x_rad, znear, zfar]`.
+///
+/// `(px, py, pz)`     — world-space camera position.
+/// `(qw, qx, qy, qz)` — orientation quaternion (cgmath / Hamilton convention).
+/// `fov_y_rad`        — vertical field of view in radians.
+/// `fov_x_rad`        — horizontal field of view in radians (derived from aspect).
+/// `znear` / `zfar`   — frustum near/far planes (auto-fitted to the AABB each frame).
+///
+/// Returns `null` until the first frame has rendered.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn get_perspective_camera_wasm() -> Option<Vec<f32>> {
+    PERSPECTIVE_CAMERA_SNAPSHOT.with(|c| c.borrow().map(|s| s.to_vec()))
+}
+
+/// Orbit-controller axis snapshot for JS diagnostics (see `snapshot_orbit_axes_for_js`).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn get_orbit_axis_debug_wasm() -> Option<Vec<f32>> {
+    ORBIT_AXIS_SNAPSHOT.with(|c| c.borrow().clone())
+}
+
+/// Install a specific perspective camera in the running event loop.
+///
+/// Used by Scene Tuner-style admin tools that need to land on an exact view.
+/// Pass `animate_ms = 0` to snap, or any positive value to hand off to the
+/// existing smoothstep `Transition<PerspectiveCamera>` animation pipeline
+/// (same path that `set_scene_camera` and `rotate_view_90` go through).
+///
+/// Pass `fov_y_rad <= 0.0` to keep the current vertical field of view; the
+/// horizontal fov is recomputed from the projection's locked aspect ratio.
+///
+/// Quaternion is `(w, x, y, z)` — cgmath / Hamilton convention.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn set_perspective_camera_wasm(
+    px: f32,
+    py: f32,
+    pz: f32,
+    qw: f32,
+    qx: f32,
+    qy: f32,
+    qz: f32,
+    fov_y_rad: f32,
+    animate_ms: f32,
+) {
+    if !px.is_finite()
+        || !py.is_finite()
+        || !pz.is_finite()
+        || !qw.is_finite()
+        || !qx.is_finite()
+        || !qy.is_finite()
+        || !qz.is_finite()
+        || !fov_y_rad.is_finite()
+        || !animate_ms.is_finite()
+    {
+        return;
+    }
+    PENDING_SET_CAMERA.with(|cell| {
+        *cell.borrow_mut() = Some([px, py, pz, qw, qx, qy, qz, fov_y_rad, animate_ms.max(0.0)]);
+    });
 }
 
 /// Apply a real-time RGBA wall color tint to the currently rendering scene.

@@ -33,16 +33,26 @@ if not exist "%JS_OUT%" (
     exit /b 1
 )
 
-REM Sync build output into apps/web/public/web-splat so the Next.js dev/prod server
-REM serves the freshly-built bundle. Copy only the generated artifacts, not the
-REM static assets that already live in apps/web/public/web-splat (index.html, etc.).
-set "WEB_PUBLIC=%~dp0..\..\apps\web\public\web-splat"
-if not exist "%WEB_PUBLIC%\" (
-    echo [build_wasm.bat] ERROR: destination folder missing: "%WEB_PUBLIC%"
-    exit /b 1
+REM Sync build output into every Next.js public/web-splat folder so each dev/prod
+REM server serves the freshly-built bundle. Copy only the generated artifacts,
+REM not the static assets that already live alongside (index.html, etc.).
+REM
+REM NOTE: BOTH apps must be synced. The admin portal's /ply-tuner and the
+REM customer Studio /scene-tuner both call set_perspective_camera_wasm via
+REM packages/viewer; a stale apps/admin-portal copy silently disables those
+REM controls (typeof mod.set_perspective_camera_wasm !== "function" path in
+REM packages/viewer/src/viewer-camera-bridge.ts::setCameraState).
+for %%P in (
+    "%~dp0..\..\apps\web\public\web-splat"
+    "%~dp0..\..\apps\admin-portal\public\web-splat"
+) do (
+    if not exist "%%~P\" (
+        echo [build_wasm.bat] ERROR: destination folder missing: %%~P
+        exit /b 1
+    )
+    copy /Y "%~dp0public\web_splats.js" "%%~P\web_splats.js" >nul
+    if errorlevel 1 exit /b 1
+    copy /Y "%~dp0public\web_splats_bg.wasm" "%%~P\web_splats_bg.wasm" >nul
+    if errorlevel 1 exit /b 1
+    echo synced: web_splats.js + web_splats_bg.wasm -^> %%~P
 )
-copy /Y "%~dp0public\web_splats.js" "%WEB_PUBLIC%\web_splats.js"
-if errorlevel 1 exit /b 1
-copy /Y "%~dp0public\web_splats_bg.wasm" "%WEB_PUBLIC%\web_splats_bg.wasm"
-if errorlevel 1 exit /b 1
-echo synced: web_splats.js + web_splats_bg.wasm -^> apps\web\public\web-splat\
