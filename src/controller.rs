@@ -8,6 +8,7 @@ use web_time::Duration;
 use winit::keyboard::KeyCode;
 
 use crate::camera::PerspectiveCamera;
+use crate::occupancy::{EyeMove, OccupancyGrid};
 
 #[derive(Debug, Clone)]
 pub struct TouchState {
@@ -80,6 +81,10 @@ pub struct CameraController {
 
     // Touch support
     pub touch_state: TouchState,
+
+    /// Solid cells from the loaded splat. User moves never enter them;
+    /// animations (tour, cinematic sweep, snaps) are not constrained.
+    pub walls: Option<OccupancyGrid>,
 }
 
 impl CameraController {
@@ -108,6 +113,7 @@ impl CameraController {
             alt_pressed: false,
             user_inptut: false,
             touch_state: TouchState::new(),
+            walls: None,
         }
     }
 
@@ -291,6 +297,7 @@ impl CameraController {
             return;
         }
 
+        let start_pos = camera.position;
         let mut dir = camera.position - self.center;
         let distance = dir.magnitude();
         // Safety: prevent NaN from zero-length direction
@@ -332,6 +339,15 @@ impl CameraController {
         self.center += offset;
         camera.position += offset;
 
+        // Walk and pan move eye and pivot together, so the pivot takes the
+        // same correction and the view direction is unchanged.
+        if let Some(walls) = &self.walls {
+            let allowed = walls.resolve(start_pos, camera.position, EyeMove::Slide);
+            self.center += allowed - camera.position;
+            camera.position = allowed;
+        }
+        let moved_pos = camera.position;
+
         // 3. Orbit rotation (arrow keys + mouse drag)
         let mut theta = Rad((self.rotation.x) * dt * self.sensitivity);
         let mut phi   = Rad((-self.rotation.y) * dt * self.sensitivity);
@@ -361,6 +377,18 @@ impl CameraController {
         }
         if angle_short(y_axis, new_dir) < Rad(0.1) {
             new_dir = dir;
+        }
+        // Orbit and zoom move only the eye; stop it so the view does not
+        // jump sideways along the wall.
+        if let Some(walls) = &self.walls {
+            let allowed = walls.resolve(moved_pos, self.center + new_dir, EyeMove::Stop);
+            let clamped = allowed - self.center;
+            let held = moved_pos - self.center;
+            if clamped.magnitude() > 1e-6 && angle_short(y_axis, clamped) >= Rad(0.1) {
+                new_dir = clamped;
+            } else if held.magnitude() > 1e-6 {
+                new_dir = held;
+            }
         }
         camera.position = self.center + new_dir;
 

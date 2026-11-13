@@ -39,6 +39,8 @@ mod camera;
 pub use camera::{Camera, PerspectiveCamera, PerspectiveProjection, VIEWPORT_Y_FLIP};
 mod controller;
 pub use controller::CameraController;
+mod occupancy;
+pub use occupancy::OccupancyGrid;
 mod pointcloud;
 pub use pointcloud::{Aabb, PointCloud};
 
@@ -266,6 +268,7 @@ impl WindowContext {
         // heuristic — so the initial view matches the thumbnail exactly.
         let (view_camera, centroid, world_up, scene_analysis) =
             auto_frame_from_raw(&pc_raw, size.width, size.height, CameraHint::Auto);
+        let walls = wall_collision_for_raw(&pc_raw);
         let pc = PointCloud::new(&device, pc_raw)?;
         log::info!("loaded point cloud with {:} points", pc.num_points());
 
@@ -276,6 +279,7 @@ impl WindowContext {
         let mut controller = CameraController::new(0.1, 0.05);
         controller.center = centroid;
         controller.up = Some(world_up);
+        controller.walls = walls;
 
         // Cache scene bounds so JS can read them via get_scene_bounds() at any time.
         #[cfg(target_arch = "wasm32")]
@@ -350,6 +354,7 @@ impl WindowContext {
             let file = std::fs::File::open(file_path)?;
             let pc_raw = io::GenericGaussianPointCloud::load(file)?;
             self.scene_analysis = scene_analysis_for_raw(&pc_raw);
+            self.controller.walls = wall_collision_for_raw(&pc_raw);
             self.pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
         } else {
             return Err(anyhow::anyhow!("no pointcloud file path present"));
@@ -381,6 +386,7 @@ impl WindowContext {
             CameraHint::Auto,
         );
         self.scene_analysis = scene_analysis;
+        self.controller.walls = wall_collision_for_raw(&pc_raw);
         self.pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
         self.controller.center = centroid;
         if preserve_camera {
@@ -1047,6 +1053,22 @@ pub fn clip_aabb_from_scene_analysis(analysis: &SceneAnalysis) -> Aabb<f32> {
             analysis.bb_max.z(),
         ),
     )
+}
+
+/// Wall grid from splat centers. None when the cloud is too sparse to form a surface.
+fn wall_collision_for_raw(pc_raw: &io::GenericGaussianPointCloud) -> Option<OccupancyGrid> {
+    let (positions, _) = pc_raw.positions_and_opacities();
+    let walls = OccupancyGrid::build(&positions);
+    match &walls {
+        Some(grid) => log::info!(
+            "[web-splat] wall collision: {} solid cells, cell {:.3}, {} centers",
+            grid.solid_cells(),
+            grid.cell(),
+            positions.len()
+        ),
+        None => log::info!("[web-splat] wall collision: off (no surface in point cloud)"),
+    }
+    walls
 }
 
 fn scene_analysis_for_raw(pc_raw: &io::GenericGaussianPointCloud) -> SceneAnalysis {
